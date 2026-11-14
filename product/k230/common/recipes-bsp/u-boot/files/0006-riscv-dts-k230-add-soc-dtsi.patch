@@ -1,0 +1,441 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: describe the soc for the k230 boards
+
+Describe the K230 SoC as the K230 boards use it: the CPU, fixed clocks,
+UARTs, MMC, SPI, I2C, USB OTG, the pin controllers and PWM. The nodes
+SPL needs carry bootph-all, and the pin macros come from k230_dt.h.
+
+Upstream-Status: Pending
+---
+ arch/riscv/dts/k230.dtsi | 358 +++++++++++++++++++++++++++------------
+ 1 file changed, 247 insertions(+), 111 deletions(-)
+
+diff --git a/arch/riscv/dts/k230.dtsi b/arch/riscv/dts/k230.dtsi
+index cf596677..8b9ef850 100644
+--- a/arch/riscv/dts/k230.dtsi
++++ b/arch/riscv/dts/k230.dtsi
+@@ -2,173 +2,309 @@
+ /*
+  * Copyright (C) 2024 Yangyu Chen <cyy@cyyself.name>
+  * Copyright (C) 2025 Junhui Liu <junhui.liu@pigmoral.tech>
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
+  */
+ 
+-#include <dt-bindings/interrupt-controller/irq.h>
++/dts-v1/;
++#include <dt-bindings/pinctrl/k230_dt.h>
+ 
+ / {
++	model = "kendryte k230";
++	compatible = "kendryte,k230";
+ 	#address-cells = <2>;
+ 	#size-cells = <2>;
+-	compatible = "canaan,kendryte-k230";
+ 
+ 	aliases {
+-		serial0 = &uart0;
+-		serial1 = &uart1;
+-		serial2 = &uart2;
+-		serial3 = &uart3;
+-		serial4 = &uart4;
++		uart0 = &serial0;
++	};
++
++	chosen {
++		bootargs = "console=ttyS0,115200n8";
++		stdout-path = "uart0:115200n8";
+ 	};
+ 
+ 	cpus {
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+ 		timebase-frequency = <27000000>;
+-
++		bootph-all;
+ 		cpu@0 {
+-			compatible = "thead,c908", "riscv";
+ 			device_type = "cpu";
+ 			reg = <0>;
+-			riscv,isa = "rv64imafdcv_zicbom_zicbop_zicboz_zfh_zba_zbb_zbc_zbs_zvfh_svpbmt";
+-			riscv,isa-base = "rv64i";
+-			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "v", "zicbom",
+-					       "zicbop", "zicboz", "zicntr", "zicsr", "zifencei",
+-					       "zihpm", "zfh", "zba", "zbb", "zbc", "zbs", "zvfh",
+-					       "svpbmt";
+-			riscv,cbom-block-size = <64>;
+-			riscv,cbop-block-size = <64>;
+-			riscv,cboz-block-size = <64>;
++			status = "okay";
++			compatible = "riscv";
++			riscv,isa = "rv64imafdcvsu";
+ 			mmu-type = "riscv,sv39";
+-
+-			cpu0_intc: interrupt-controller {
+-				compatible = "riscv,cpu-intc";
+-				interrupt-controller;
+-				#interrupt-cells = <1>;
+-			};
++			clock-frequency = <800000000>;
++			bootph-all;
+ 		};
+ 	};
+ 
+-	apb_clk: apb-clk-clock {
+-		compatible = "fixed-clock";
+-		clock-frequency = <50000000>;
+-		clock-output-names = "apb_clk";
+-		#clock-cells = <0>;
+-	};
+-
+-	clk_dummy: clock-dummy {
+-		compatible = "fixed-clock";
+-		clock-frequency = <0>;
+-		clock-output-names = "clk_dummy";
+-		#clock-cells = <0>;
+-	};
+-
+-	reboot: syscon-reboot {
+-		compatible = "syscon-reboot";
+-		regmap = <&bootctl>;
+-		offset = <0x60>;
+-		mask = <0x10001>;
+-		value = <0x10001>;
+-	};
+-
+ 	soc {
+-		compatible = "simple-bus";
+-		interrupt-parent = <&plic>;
+ 		#address-cells = <2>;
+ 		#size-cells = <2>;
+-		dma-noncoherent;
++		compatible = "simple-bus";
+ 		ranges;
++		bootph-all;
+ 
+-		bootctl: syscon@0x91102000 {
+-			compatible = "syscon";
+-			reg = <0x0 0x91102000 0x0 0x1000>;
++		def_50mhz: default_50mhz {
++			compatible = "fixed-clock";
++			clock-frequency = <50000000>;
++			clock-output-names = "fix-50mhz";
++			#clock-cells = <0>;
++			bootph-all;
+ 		};
+ 
+-		plic: interrupt-controller@f00000000 {
+-			compatible = "canaan,k230-plic" ,"thead,c900-plic";
+-			reg = <0xf 0x00000000 0x0 0x04000000>;
+-			interrupts-extended = <&cpu0_intc 11>, <&cpu0_intc 9>;
+-			interrupt-controller;
+-			#address-cells = <0>;
+-			#interrupt-cells = <2>;
+-			riscv,ndev = <208>;
++		def_100mhz: default_100mhz {
++			compatible = "fixed-clock";
++			clock-frequency = <100000000>;
++			clock-output-names = "fix-100mhz";
++			#clock-cells = <0>;
++			bootph-all;
+ 		};
+ 
+-		clint: timer@f04000000 {
+-			compatible = "canaan,k230-clint", "thead,c900-clint";
+-			reg = <0xf 0x04000000 0x0 0x00010000>;
+-			interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>;
++		def_200mhz: default_200mhz {
++			compatible = "fixed-clock";
++			clock-frequency = <200000000>;
++			clock-output-names = "fix-200mhz";
++			#clock-cells = <0>;
++			bootph-all;
+ 		};
+ 
+-		uart0: serial@91400000 {
++		def_800mhz: default_800mhz {
++			compatible = "fixed-clock";
++			clock-frequency = <800000000>;
++			clock-output-names = "fix-800mhz";
++			#clock-cells = <0>;
++			bootph-all;
++		};
++
++		serial0: serial@91400000 {
+ 			compatible = "snps,dw-apb-uart";
+-			reg = <0x0 0x91400000 0x0 0x1000>;
+-			clocks = <&apb_clk>;
+-			interrupts = <16 IRQ_TYPE_LEVEL_HIGH>;
+-			reg-io-width = <4>;
++			reg = <0x0 0x91400000 0x0 0x400>;
++			clocks = <&def_50mhz>;
++			clock-names = "baudclk";
+ 			reg-shift = <2>;
+-			status = "disabled";
++			reg-io-width = <4>;
++			bootph-all;
+ 		};
+ 
+-		uart1: serial@91401000 {
++		serial1: serial@91401000 {
+ 			compatible = "snps,dw-apb-uart";
+-			reg = <0x0 0x91401000 0x0 0x1000>;
+-			clocks = <&apb_clk>;
+-			interrupts = <17 IRQ_TYPE_LEVEL_HIGH>;
+-			reg-io-width = <4>;
++			reg = <0x0 0x91401000 0x0 0x400>;
++			clocks = <&def_50mhz>;
++			clock-names = "baudclk";
+ 			reg-shift = <2>;
+-			status = "disabled";
++			reg-io-width = <4>;
++			bootph-all;
+ 		};
+ 
+-		uart2: serial@91402000 {
++		serial2: serial@91402000 {
+ 			compatible = "snps,dw-apb-uart";
+-			reg = <0x0 0x91402000 0x0 0x1000>;
+-			clocks = <&apb_clk>;
+-			interrupts = <18 IRQ_TYPE_LEVEL_HIGH>;
+-			reg-io-width = <4>;
++			reg = <0x0 0x91402000 0x0 0x400>;
++			clocks = <&def_50mhz>;
++			clock-names = "baudclk";
+ 			reg-shift = <2>;
+-			status = "disabled";
++			reg-io-width = <4>;
++			bootph-all;
+ 		};
+ 
+-		uart3: serial@91403000 {
++		serial3: serial@91403000 {
+ 			compatible = "snps,dw-apb-uart";
+-			reg = <0x0 0x91403000 0x0 0x1000>;
+-			clocks = <&apb_clk>;
+-			interrupts = <19 IRQ_TYPE_LEVEL_HIGH>;
+-			reg-io-width = <4>;
++			reg = <0x0 0x91403000 0x0 0x400>;
++			clocks = <&def_50mhz>;
++			clock-names = "baudclk";
+ 			reg-shift = <2>;
+-			status = "disabled";
++			reg-io-width = <4>;
++			bootph-all;
+ 		};
+ 
+-		uart4: serial@91404000 {
++		serial4: serial@91404000 {
+ 			compatible = "snps,dw-apb-uart";
+-			reg = <0x0 0x91404000 0x0 0x1000>;
+-			clocks = <&apb_clk>;
+-			interrupts = <20 IRQ_TYPE_LEVEL_HIGH>;
+-			reg-io-width = <4>;
++			reg = <0x0 0x91404000 0x0 0x400>;
++			clocks = <&def_50mhz>;
++			clock-names = "baudclk";
+ 			reg-shift = <2>;
++			reg-io-width = <4>;
++			bootph-all;
++		};
++
++		mmc0: mmc0@91580000 {
++			compatible = "snps,dwcmshc-sdhci-k230";
++			reg = <0x0 0x91580000 0x0 0x400>;
++			bus-width = <8>;
++			clocks = <&def_200mhz>;
++			max-frequency = <200000000>;
++			fifo-mode;
++			have-emmc-phy;
+ 			status = "disabled";
++			bootph-all;
++		};
++
++		mmc1: mmc1@91581000 {
++			compatible = "snps,dwcmshc-sdhci";
++			reg = <0x0 0x91581000 0x0 0x400>;
++			bus-width = <4>;
++			clocks = <&def_100mhz>;
++			max-frequency = <50000000>;
++			fifo-mode;
++			status = "disabled";
++			bootph-all;
++		};
++
++		spi0: spi@91584000 {
++			compatible = "snps,dwc-ssi-1.01a";
++			reg = <0x0 0x91584000 0x0 0x1000>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			num-cs = <1>;
++			clocks = <&def_800mhz>;
++			spi-max-frequency = <100000000>;
++			dtr-max-frequency = <100000000>;
++			status = "disabled";
++			bootph-all;
++		};
++
++		spi1: spi@91582000 {
++			compatible = "snps,dwc-ssi-1.01a";
++			reg = <0x0 0x91582000 0x0 0x1000>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			num-cs = <5>;
++			clocks = <&def_200mhz>;
++			spi-max-frequency = <100000000>;
++			status = "disabled";
++			bootph-all;
++		};
++
++		spi2: spi@91583000 {
++			compatible = "snps,dwc-ssi-1.01a";
++			reg = <0x0 0x91583000 0x0 0x1000>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			num-cs = <5>;
++			clocks = <&def_200mhz>;
++			spi-max-frequency = <100000000>;
++			status = "disabled";
++			bootph-all;
++		};
++
++		i2c0: i2c@91405000 {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			clocks = <&def_100mhz>;
++			compatible = "snps,designware-i2c";
++			reg = <0x0 0x91405000 0x0 0x1000>;
++			clock-frequency = <100000>;
++			status = "disabled";
++		};
++
++		i2c1: i2c@91406000 {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			clocks = <&def_100mhz>;
++			compatible = "snps,designware-i2c";
++			reg = <0x0 0x91406000 0x0 0x1000>;
++			clock-frequency = <400000>;
++			status = "disabled";
++		};
++
++		i2c2: i2c@91407000 {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			clocks = <&def_100mhz>;
++			compatible = "snps,designware-i2c";
++			reg = <0x0 0x91407000 0x0 0x1000>;
++			clock-frequency = <400000>;
++			status = "disabled";
++		};
++
++		i2c3: i2c@91408000 {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			clocks = <&def_100mhz>;
++			compatible = "snps,designware-i2c";
++			reg = <0x0 0x91408000 0x0 0x1000>;
++			clock-frequency = <400000>;
++			status = "disabled";
++		};
++
++		i2c4: i2c@91409000 {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			clocks = <&def_100mhz>;
++			compatible = "snps,designware-i2c";
++			reg = <0x0 0x91409000 0x0 0x1000>;
++			clock-frequency = <400000>;
++			status = "disabled";
++		};
++
++		usbotg0: usb-otg@91500000 {
++			compatible = "snps,dwc2";
++			reg = <0x0 0x91500000 0x0 0x10000>;
++			g-tx-fifo-size = <128 128 128 128 128 128>;
++			dr_mode = "otg";
++			otg-rev = <0x200>;
++#ifndef CONFIG_CMD_DFU
++			status = "disabled";
++#endif
++		};
++
++		usbotg1: usb-otg@91540000 {
++			compatible = "snps,dwc2";
++			reg = <0x0 0x91540000 0x0 0x10000>;
++			g-tx-fifo-size = <128 128 128 128 128 128>;
++			dr_mode = "otg";
++			otg-rev = <0x200>;
++			status = "disabled";
++		};
++
++		iomux: iomux@91105000 {
++			compatible = "pinctrl-single";
++			reg = <0x0 0x91105000 0x0 0x10000>;
++			#pinctrl-cells = <1>;
++			pinctrl-single,register-width = <32>;
++			pinctrl-single,function-mask = <0xffffffff>;
++			bootph-all;
++		};
++
++		pmu_iomux: pmu_iomux@91000080 {
++			compatible = "pinctrl-single";
++			reg = <0x0 0x91000080 0x0 0x20>;
++			#pinctrl-cells = <1>;
++			pinctrl-single,register-width = <32>;
++			pinctrl-single,function-mask = <0xffffffff>;
++			status = "disabled";
++			bootph-all;
++			pinctrl-names = "default";
++			pinctrl-0 = <&pmu_pins>;
++
++			pmu_pins: pmu_pins {
++				bootph-all;
++				pinctrl-single,pins = <
++				(IO64) ( PMU_IOSEL_INT<<SEL | 0<<SL | 1<<IE | 0<<OE | 0<<PU | 1<<PD | 2<<DS | 0<<ST )
++				(IO65) ( PMU_IOSEL_INT<<SEL | 0<<SL | 1<<IE | 0<<OE | 0<<PU | 1<<PD | 2<<DS | 0<<ST )
++				(IO66) ( PMU_IOSEL_INT<<SEL | 0<<SL | 1<<IE | 0<<OE | 0<<PU | 1<<PD | 2<<DS | 0<<ST )
++				(IO67) ( PMU_IOSEL_INT<<SEL | 0<<SL | 1<<IE | 0<<OE | 0<<PU | 1<<PD | 2<<DS | 0<<ST )
++				(IO68) ( PMU_IOSEL_INT<<SEL | 0<<SL | 1<<IE | 0<<OE | 0<<PU | 1<<PD | 2<<DS | 0<<ST )
++				(IO69) ( PMU_IOSEL_INT<<SEL | 0<<SL | 1<<IE | 0<<OE | 0<<PU | 1<<PD | 2<<DS | 0<<ST )
++				(IO70) ( PMU_IOSEL_INT<<SEL | 0<<SL | 0<<IE | 1<<OE | 0<<PU | 0<<PD | 2<<DS | 0<<ST )
++				(IO71) ( PMU_IOSEL_INT<<SEL | 0<<SL | 0<<IE | 1<<OE | 0<<PU | 0<<PD | 2<<DS | 0<<ST )
++				>;
++			};
+ 		};
+ 
+-		usb0: usb@91500000 {
+-			compatible = "canaan,k230-otg", "snps,dwc2";
+-			reg = <0x0 0x91500000 0x0 0x40000>;
+-			interrupts = <173 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&clk_dummy>;
+-			clock-names = "otg";
+-			g-rx-fifo-size = <512>;
+-			g-np-tx-fifo-size = <64>;
+-			g-tx-fifo-size = <512 1024 64 64 64 64>;
++		pwm0: pwm@9140a000 {
++			compatible = "kendryte,pwm";
++			reg = <0x0 0x9140a000 0x0 0x40>;
++			clocks = <&def_100mhz>;
+ 			status = "disabled";
+ 		};
+ 
+-		usb1: usb@91540000 {
+-			compatible = "canaan,k230-otg", "snps,dwc2";
+-			reg = <0x0 0x91540000 0x0 0x40000>;
+-			interrupts = <174 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&clk_dummy>;
+-			clock-names = "otg";
+-			g-rx-fifo-size = <512>;
+-			g-np-tx-fifo-size = <64>;
+-			g-tx-fifo-size = <512 1024 64 64 64 64>;
++		pwm1: pwm@9140a040 {
++			compatible = "kendryte,pwm";
++			reg = <0x0 0x9140a040 0x0 0x40>;
++			clocks = <&def_100mhz>;
+ 			status = "disabled";
+ 		};
+ 	};
+-- 
+2.43.0
+

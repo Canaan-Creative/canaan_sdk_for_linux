@@ -1,0 +1,455 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] env: add a spi-nand environment backend
+
+Add ENV_IS_IN_SPI_NAND, an environment location on a SPI-NAND MTD
+device, and ENV_SPINAND_NAME to name that device. The K230 boards that
+boot from SPI-NAND keep their environment there and the K230 image
+loader uses the same device.
+
+Upstream-Status: Pending
+---
+ env/Kconfig            |  25 +++-
+ env/Makefile           |   1 +
+ env/env.c              |   3 +
+ env/spinand.c          | 325 +++++++++++++++++++++++++++++++++++++++++
+ include/env_internal.h |   1 +
+ 5 files changed, 351 insertions(+), 4 deletions(-)
+ create mode 100644 env/spinand.c
+
+diff --git a/env/Kconfig b/env/Kconfig
+index d7a7e811..76aa5ddc 100644
+--- a/env/Kconfig
++++ b/env/Kconfig
+@@ -74,7 +74,8 @@ config ENV_IS_DEFAULT
+ 		     !ENV_IS_IN_MMC && !ENV_IS_IN_NAND && \
+ 		     !ENV_IS_IN_NVRAM && !ENV_IS_IN_ONENAND && \
+ 		     !ENV_IS_IN_REMOTE && !ENV_IS_IN_SPI_FLASH && \
+-		     !ENV_IS_IN_UBI && !ENV_IS_IN_MTD
++		     !ENV_IS_IN_UBI && !ENV_IS_IN_MTD && \
++		     !ENV_IS_IN_SPI_NAND
+ 	select ENV_IS_NOWHERE
+ 
+ config ENV_IS_NOWHERE
+@@ -299,7 +300,7 @@ config ENV_IS_IN_NAND
+ 
+ config ENV_RANGE
+ 	hex "Length of the region in which the environment can be written"
+-	depends on ENV_IS_IN_NAND
++	depends on ENV_IS_IN_NAND || ENV_IS_IN_SPI_NAND
+ 	range ENV_SIZE 0x7fffffff
+ 	default ENV_SIZE
+ 	help
+@@ -493,6 +494,21 @@ config SYS_REDUNDAND_ENVIRONMENT
+ 	  which is used by env import/export commands which are independent of
+ 	  storing variables to redundant location on a non volatile device.
+ 
++config ENV_IS_IN_SPI_NAND
++	bool "Environment in a SPI NAND device"
++	help
++	  Define this if you have a SPI NAND device used to store the
++	  environment and the K230 firmware images. The K230 image loader
++	  reads SPI-NAND only when this is set.
++
++config ENV_SPINAND_NAME
++	string "Name of the SPINAND MTD for the environment"
++	depends on ENV_IS_IN_SPI_NAND
++	default "spi-nand0"
++	help
++	  MTD device that holds the environment and that the K230 image
++	  loader reads.
++
+ config ENV_FAT_INTERFACE
+ 	string "Name of the block device for the environment"
+ 	depends on ENV_IS_IN_FAT
+@@ -596,7 +612,7 @@ config ENV_ADDR_REDUND
+ config ENV_OFFSET
+ 	hex "Environment offset"
+ 	depends on ENV_IS_IN_EEPROM || ENV_IS_IN_MMC || ENV_IS_IN_NAND || \
+-		    ENV_IS_IN_SPI_FLASH || ENV_IS_IN_MTD
++		    ENV_IS_IN_SPI_FLASH || ENV_IS_IN_MTD || ENV_IS_IN_SPI_NAND
+ 	default 0x3f8000 if ARCH_ROCKCHIP && ENV_IS_IN_MMC
+ 	default 0x140000 if ARCH_ROCKCHIP && ENV_IS_IN_SPI_FLASH
+ 	default 0xF0000 if ARCH_SUNXI
+@@ -618,7 +634,8 @@ config ENV_OFFSET
+ config ENV_OFFSET_REDUND
+ 	hex "Redundant environment offset"
+ 	depends on (ENV_IS_IN_EEPROM || ENV_IS_IN_MMC || ENV_IS_IN_NAND || \
+-		    ENV_IS_IN_SPI_FLASH) && SYS_REDUNDAND_ENVIRONMENT
++		    ENV_IS_IN_SPI_FLASH || ENV_IS_IN_SPI_NAND) && \
++		   SYS_REDUNDAND_ENVIRONMENT
+ 	default 0x10C0000 if MICROBLAZE
+ 	default 0x0
+ 	help
+diff --git a/env/Makefile b/env/Makefile
+index 3b9c71d5..5a314fd0 100644
+--- a/env/Makefile
++++ b/env/Makefile
+@@ -27,6 +27,7 @@ obj-$(CONFIG_$(PHASE_)ENV_IS_IN_EXT4) += ext4.o
+ obj-$(CONFIG_$(PHASE_)ENV_IS_IN_NAND) += nand.o
+ obj-$(CONFIG_$(PHASE_)ENV_IS_IN_SPI_FLASH) += sf.o
+ obj-$(CONFIG_$(PHASE_)ENV_IS_IN_MTD) += mtd.o
++obj-$(CONFIG_$(PHASE_)ENV_IS_IN_SPI_NAND) += spinand.o
+ obj-$(CONFIG_$(PHASE_)ENV_IS_IN_FLASH) += flash.o
+ 
+ CFLAGS_embedded.o := -Wa,--no-warn -DENV_CRC=$(shell tools/envcrc 2>/dev/null)
+diff --git a/env/env.c b/env/env.c
+index dbaeedc3..e4c894f0 100644
+--- a/env/env.c
++++ b/env/env.c
+@@ -64,6 +64,9 @@ static enum env_location env_locations[] = {
+ #ifdef CONFIG_ENV_IS_IN_UBI
+ 	ENVL_UBI,
+ #endif
++#ifdef CONFIG_ENV_IS_IN_SPI_NAND
++	ENVL_SPINAND,
++#endif
+ #ifdef CONFIG_ENV_IS_NOWHERE
+ 	ENVL_NOWHERE,
+ #endif
+diff --git a/env/spinand.c b/env/spinand.c
+new file mode 100644
+index 00000000..a853f2f4
+--- /dev/null
++++ b/env/spinand.c
+@@ -0,0 +1,325 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * (C) Copyright 2000-2010
++ * Wolfgang Denk, DENX Software Engineering, wd@denx.de.
++ *
++ * (C) Copyright 2008
++ * Stuart Wood, Lab X Technologies <stuart.wood@labxtechnologies.com>
++ *
++ * (C) Copyright 2004
++ * Jian Zhang, Texas Instruments, jzhang@ti.com.
++ *
++ * (C) Copyright 2001 Sysgo Real-Time Solutions, GmbH <www.elinos.com>
++ * Andreas Heppel <aheppel@sysgo.de>
++ *
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++/* SPI-NAND environment backend for K230. */
++
++#include <command.h>
++#include <env.h>
++#include <env_internal.h>
++#include <linux/stddef.h>
++#include <malloc.h>
++#include <memalign.h>
++#include <nand.h>
++#include <search.h>
++#include <errno.h>
++#include <u-boot/crc.h>
++#include <mtd.h>
++
++#if defined(CONFIG_CMD_SAVEENV) && defined(CONFIG_CMD_MTD) && \
++	!defined(CONFIG_XPL_BUILD)
++#define CMD_SAVEENV
++#elif defined(CONFIG_ENV_OFFSET_REDUND) && !defined(CONFIG_XPL_BUILD)
++#error CONFIG_ENV_OFFSET_REDUND must have CONFIG_CMD_SAVEENV & CONFIG_CMD_MTD
++#endif
++
++#ifndef CONFIG_ENV_RANGE
++#define CONFIG_ENV_RANGE CONFIG_ENV_SIZE
++#endif
++
++#define SPINAND_NAME CONFIG_ENV_SPINAND_NAME
++
++DECLARE_GLOBAL_DATA_PTR;
++
++static struct mtd_info *get_mtd_by_name(const char *name)
++{
++	struct mtd_info *mtd;
++
++	mtd_probe_devices();
++
++	mtd = get_mtd_device_nm(name);
++	if (IS_ERR_OR_NULL(mtd))
++		printf("MTD device %s not found, ret %ld\n", name,
++		       PTR_ERR(mtd));
++
++	return mtd;
++}
++
++static bool mtd_is_aligned_with_block_size(struct mtd_info *mtd, u64 size)
++{
++	return !do_div(size, mtd->erasesize);
++}
++
++static int env_spinand_init(void)
++{
++	gd->env_addr = (ulong)&default_environment[0];
++	gd->env_valid = ENV_VALID;
++	return 0;
++}
++
++#ifdef CMD_SAVEENV
++static int writeenv(size_t offset, u_char *buf)
++{
++	size_t end = offset + CONFIG_ENV_RANGE;
++	size_t amount_saved = 0;
++	size_t blocksize;
++	struct mtd_info *mtd;
++	struct mtd_oob_ops io_op = {};
++
++	mtd = get_mtd_by_name(SPINAND_NAME);
++	if (IS_ERR_OR_NULL(mtd))
++		return 1;
++
++	blocksize = mtd->erasesize;
++
++	io_op.mode = MTD_OPS_AUTO_OOB;
++	io_op.len = mtd->writesize;
++	io_op.ooblen = 0;
++	io_op.oobbuf = NULL;
++
++	while (amount_saved < CONFIG_ENV_SIZE && offset < end) {
++		if (mtd_block_isbad(mtd, offset)) {
++			offset += blocksize;
++		} else {
++			io_op.datbuf = &buf[amount_saved];
++			if (mtd_write_oob(mtd, offset, &io_op))
++				goto out_put_mtd;
++
++			offset += io_op.retlen;
++			amount_saved += io_op.retlen;
++		}
++	}
++	if (amount_saved != CONFIG_ENV_SIZE)
++		goto out_put_mtd;
++
++	put_mtd_device(mtd);
++	return 0;
++
++out_put_mtd:
++	put_mtd_device(mtd);
++	return 1;
++}
++
++struct nand_env_location {
++	const char			*name;
++	const nand_erase_options_t	erase_opts;
++};
++
++static int erase_and_write_env(const struct nand_env_location *location,
++			       u_char *env_new)
++{
++	struct mtd_info *mtd;
++	int ret = 0;
++	struct erase_info erase_op = {};
++	u64 off, len;
++
++	off = location->erase_opts.offset;
++	len = location->erase_opts.length;
++
++	mtd = get_mtd_by_name(SPINAND_NAME);
++	if (IS_ERR_OR_NULL(mtd))
++		return 1;
++
++	if (!mtd_is_aligned_with_block_size(mtd, off)) {
++		printf("Offset not aligned with a block (0x%x)\n",
++		       mtd->erasesize);
++		put_mtd_device(mtd);
++		return 1;
++	}
++
++	erase_op.mtd = mtd;
++	erase_op.addr = off;
++	erase_op.len = len;
++	erase_op.scrub = 0;
++
++	printf("Erasing %s...\n", location->name);
++	while (erase_op.len) {
++		ret = mtd_erase(mtd, &erase_op);
++
++		if (ret != -EIO)
++			break;
++
++		printf("Skipping bad block at 0x%08llx\n", erase_op.fail_addr);
++
++		erase_op.len -= erase_op.fail_addr - erase_op.addr;
++		erase_op.len -= mtd->erasesize;
++		erase_op.addr = erase_op.fail_addr + mtd->erasesize;
++	}
++
++	put_mtd_device(mtd);
++	if (ret && ret != -EIO)
++		return 1;
++
++	printf("Writing to %s... ", location->name);
++	ret = writeenv(location->erase_opts.offset, env_new);
++	puts(ret ? "FAILED!\n" : "OK\n");
++
++	return ret;
++}
++
++static int env_spinand_save(void)
++{
++	int ret = 0;
++
++	ALLOC_CACHE_ALIGN_BUFFER(env_t, env_new, 1);
++	int env_idx = 0;
++	static const struct nand_env_location location[] = {
++		{
++			.name = "SPINAND",
++			.erase_opts = {
++				.length = CONFIG_ENV_RANGE,
++				.offset = CONFIG_ENV_OFFSET,
++			},
++		},
++#ifdef CONFIG_ENV_OFFSET_REDUND
++		{
++			.name = "redundant SPINAND",
++			.erase_opts = {
++				.length = CONFIG_ENV_RANGE,
++				.offset = CONFIG_ENV_OFFSET_REDUND,
++			},
++		},
++#endif
++	};
++
++	if (CONFIG_ENV_RANGE < CONFIG_ENV_SIZE)
++		return 1;
++
++	ret = env_export(env_new);
++	if (ret)
++		return ret;
++
++#ifdef CONFIG_ENV_OFFSET_REDUND
++	env_idx = (gd->env_valid == ENV_VALID);
++#endif
++
++	ret = erase_and_write_env(&location[env_idx], (u_char *)env_new);
++#ifdef CONFIG_ENV_OFFSET_REDUND
++	if (!ret) {
++		gd->env_valid = (gd->env_valid == ENV_REDUND) ? ENV_VALID :
++								ENV_REDUND;
++		return ret;
++	}
++
++	env_idx = (env_idx + 1) & 1;
++	ret = erase_and_write_env(&location[env_idx], (u_char *)env_new);
++	if (!ret)
++		printf("Warning: primary env write failed,"
++		       " redundancy is lost!\n");
++#endif
++
++	return ret;
++}
++#endif /* CMD_SAVEENV */
++
++static int readenv(size_t offset, u_char *buf)
++{
++	size_t end = offset + CONFIG_ENV_RANGE;
++	size_t amount_loaded = 0;
++	size_t blocksize;
++	struct mtd_info *mtd;
++	struct mtd_oob_ops io_op = {};
++	int ret;
++
++	mtd = get_mtd_by_name(SPINAND_NAME);
++	if (IS_ERR_OR_NULL(mtd))
++		return 1;
++
++	blocksize = mtd->erasesize;
++
++	io_op.mode = MTD_OPS_AUTO_OOB;
++	io_op.len = mtd->writesize;
++	io_op.ooblen = 0;
++	io_op.oobbuf = NULL;
++
++	while (amount_loaded < CONFIG_ENV_SIZE && offset < end) {
++		if (mtd_block_isbad(mtd, offset)) {
++			offset += blocksize;
++		} else {
++			io_op.datbuf = &buf[amount_loaded];
++			ret = mtd_read_oob(mtd, offset, &io_op);
++			if (ret && !mtd_is_bitflip(ret))
++				goto out_put_mtd;
++
++			offset += io_op.retlen;
++			amount_loaded += io_op.retlen;
++		}
++	}
++
++	if (amount_loaded != CONFIG_ENV_SIZE)
++		goto out_put_mtd;
++
++	put_mtd_device(mtd);
++	return 0;
++
++out_put_mtd:
++	put_mtd_device(mtd);
++	return 1;
++}
++
++#ifdef CONFIG_ENV_OFFSET_REDUND
++static int env_spinand_load(void)
++{
++	int read1_fail, read2_fail;
++	env_t *tmp_env1, *tmp_env2;
++	int ret = 0;
++
++	tmp_env1 = (env_t *)memalign(ARCH_DMA_MINALIGN, CONFIG_ENV_SIZE);
++	tmp_env2 = (env_t *)memalign(ARCH_DMA_MINALIGN, CONFIG_ENV_SIZE);
++	if (!tmp_env1 || !tmp_env2) {
++		puts("Can't allocate buffers for environment\n");
++		env_set_default("memalign() failed", 0);
++		ret = -EIO;
++		goto done;
++	}
++
++	read1_fail = readenv(CONFIG_ENV_OFFSET, (u_char *)tmp_env1);
++	read2_fail = readenv(CONFIG_ENV_OFFSET_REDUND, (u_char *)tmp_env2);
++
++	ret = env_import_redund((char *)tmp_env1, read1_fail, (char *)tmp_env2,
++				read2_fail, H_EXTERNAL);
++
++done:
++	free(tmp_env1);
++	free(tmp_env2);
++
++	return ret;
++}
++#else
++static int env_spinand_load(void)
++{
++	int ret;
++
++	ALLOC_CACHE_ALIGN_BUFFER(char, buf, CONFIG_ENV_SIZE);
++
++	ret = readenv(CONFIG_ENV_OFFSET, (u_char *)buf);
++	if (ret) {
++		env_set_default("readenv() failed", 0);
++		return -EIO;
++	}
++
++	return env_import(buf, 1, H_EXTERNAL);
++}
++#endif /* CONFIG_ENV_OFFSET_REDUND */
++
++U_BOOT_ENV_LOCATION(spinand) = {
++	.location = ENVL_SPINAND,
++	ENV_NAME("SPINAND").load = env_spinand_load,
++#if defined(CMD_SAVEENV)
++	.save = env_save_ptr(env_spinand_save),
++#endif
++	.init = env_spinand_init,
++};
+diff --git a/include/env_internal.h b/include/env_internal.h
+index ee939ba4..95a2cea3 100644
+--- a/include/env_internal.h
++++ b/include/env_internal.h
+@@ -116,6 +116,7 @@ enum env_location {
+ 	ENVL_MTD,
+ 	ENVL_UBI,
+ 	ENVL_NOWHERE,
++	ENVL_SPINAND,
+ 
+ 	ENVL_COUNT,
+ };
+-- 
+2.43.0
+

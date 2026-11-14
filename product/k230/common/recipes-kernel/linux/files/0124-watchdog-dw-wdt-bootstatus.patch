@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] watchdog: dw_wdt: report a watchdog reset in bootstatus
+
+dw_wdt never sets wdd->bootstatus, so WDIOC_GETBOOTSTATUS is always 0
+and a board reset by the watchdog's second stage boots looking like a
+power-on. The K230 has no reset-cause register for it: the sysctl boot
+block at 0x91102000 holds reset control, reset timing and wake-up
+source registers only.
+
+Record the pre-timeout in on-chip RAM and read it back at probe. The
+record is magic 0xdeadbeef at +0, the text length at +4 and the text
+"linux wdt timeout\n" from +8.
+
+ - An optional second "reg" entry names the region. Without it nothing
+   changes.
+ - The pre-timeout interrupt writes the record before it signals the
+   owner.
+ - Probe reads the record last, after every step that can defer, sets
+   WDIOF_CARDRESET when the magic matches and the length fits in the
+   region, and clears the header, so the flag describes the previous
+   boot only. A region that cannot be mapped is reported and ignored;
+   the watchdog itself still probes.
+
+The record marks the pre-timeout, not the reset. With the pre-timeout
+armed the hardware reset comes one timeout period after it, so the
+reset is recorded whenever the interrupt handler runs; a reset taken
+while it cannot run (interrupts off on the only hart) leaves no record.
+A pre-timeout followed by a clean reboot also sets the flag.
+
+Upstream-Status: Pending
+---
+ drivers/watchdog/dw_wdt.c | 54 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/drivers/watchdog/dw_wdt.c b/drivers/watchdog/dw_wdt.c
+index dda663f5a..3ac13d521 100644
+--- a/drivers/watchdog/dw_wdt.c
++++ b/drivers/watchdog/dw_wdt.c
+@@ -59,6 +59,13 @@
+ 
+ #define DW_WDT_DEFAULT_SECONDS	30
+ 
++/* Pre-timeout record in on-chip SRAM. */
++#define DW_WDT_REC_MAGIC	0xdeadbeef
++#define DW_WDT_REC_MAGIC_OFF	0x0
++#define DW_WDT_REC_COUNT_OFF	0x4
++#define DW_WDT_REC_TEXT_OFF	0x8
++#define DW_WDT_REC_TEXT		"linux wdt timeout\n"
++
+ static const u32 dw_wdt_fix_tops[DW_WDT_NUM_TOPS] = {
+ 	DW_WDT_FIX_TOP(0), DW_WDT_FIX_TOP(1), DW_WDT_FIX_TOP(2),
+ 	DW_WDT_FIX_TOP(3), DW_WDT_FIX_TOP(4), DW_WDT_FIX_TOP(5),
+@@ -103,6 +110,7 @@ struct dw_wdt {
+ 	/* Serialises sig_pid and the response mode against the pre-timeout IRQ. */
+ 	spinlock_t		sig_lock;
+ 	struct pid		*sig_pid;
++	void __iomem		*rec;
+ };
+ 
+ #define to_dw_wdt(wdd)	container_of(wdd, struct dw_wdt, wdd)
+@@ -143,6 +151,48 @@ static void dw_wdt_signal_pretimeout(struct dw_wdt *dw_wdt)
+ 	}
+ }
+ 
++static void dw_wdt_rec_write(struct dw_wdt *dw_wdt)
++{
++	static const char text[] = DW_WDT_REC_TEXT;
++
++	memcpy_toio(dw_wdt->rec + DW_WDT_REC_TEXT_OFF, text, sizeof(text));
++	writel(sizeof(text) - 1, dw_wdt->rec + DW_WDT_REC_COUNT_OFF);
++	writel(DW_WDT_REC_MAGIC, dw_wdt->rec + DW_WDT_REC_MAGIC_OFF);
++}
++
++static void dw_wdt_rec_init(struct platform_device *pdev, struct dw_wdt *dw_wdt)
++{
++	struct resource *res;
++	void __iomem *rec;
++	u32 count;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (!res)
++		return;
++	if (resource_size(res) <
++	    DW_WDT_REC_TEXT_OFF + sizeof(DW_WDT_REC_TEXT)) {
++		dev_warn(&pdev->dev,
++			 "pre-timeout record %pR too small, ignored\n", res);
++		return;
++	}
++
++	rec = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(rec)) {
++		dev_warn(&pdev->dev, "pre-timeout record not mapped: %pe\n",
++			 rec);
++		return;
++	}
++
++	count = readl(rec + DW_WDT_REC_COUNT_OFF);
++	if (readl(rec + DW_WDT_REC_MAGIC_OFF) == DW_WDT_REC_MAGIC && count &&
++	    count <= resource_size(res) - DW_WDT_REC_TEXT_OFF)
++		dw_wdt->wdd.bootstatus |= WDIOF_CARDRESET;
++
++	writel(0, rec + DW_WDT_REC_MAGIC_OFF);
++	writel(0, rec + DW_WDT_REC_COUNT_OFF);
++	dw_wdt->rec = rec;
++}
++
+ static void dw_wdt_update_mode(struct dw_wdt *dw_wdt, enum dw_wdt_rmod rmod)
+ {
+ 	u32 val;
+@@ -420,6 +470,8 @@ static irqreturn_t dw_wdt_irq(int irq, void *devid)
+ 		return IRQ_NONE;
+ 	th1520_event_set_rebootmode(TH1520_EVENT_SW_WATCHDOG);
+ 
++	if (dw_wdt->rec)
++		dw_wdt_rec_write(dw_wdt);
+ 	dw_wdt_signal_pretimeout(dw_wdt);
+ 	/*
+ 	 * Drop back to reset response mode before acknowledging, so the next
+@@ -715,6 +767,8 @@ static int dw_wdt_drv_probe(struct platform_device *pdev)
+ 	watchdog_set_restart_priority(wdd, 128);
+ 	watchdog_stop_on_reboot(wdd);
+ 
++	dw_wdt_rec_init(pdev, dw_wdt);
++
+ 	ret = watchdog_register_device(wdd);
+ 	if (ret)
+ 		goto out_assert_rst;
+-- 
+2.43.0
+

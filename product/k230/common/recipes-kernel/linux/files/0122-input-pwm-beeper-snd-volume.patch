@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] input: pwm-beeper: set the duty cycle with SND_VOLUME
+
+The pwm-beeper drives a fixed 50% duty cycle, so the beep volume cannot
+be set. Accept an SND_VOLUME (SND_TONE + 1) event that carries the duty
+cycle in percent, keep it per beeper, use it in
+pwm_set_relative_duty_cycle() and advertise the capability so the event
+reaches the driver. The default duty cycle stays 50%.
+
+Upstream-Status: Pending
+---
+ drivers/input/misc/pwm-beeper.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/input/misc/pwm-beeper.c b/drivers/input/misc/pwm-beeper.c
+index 5b9aedf43..b1515b1d6 100644
+--- a/drivers/input/misc/pwm-beeper.c
++++ b/drivers/input/misc/pwm-beeper.c
+@@ -21,6 +21,7 @@ struct pwm_beeper {
+ 	struct regulator *amplifier;
+ 	struct work_struct work;
+ 	unsigned long period;
++	unsigned long duty;
+ 	unsigned int bell_frequency;
+ 	bool suspended;
+ 	bool amplifier_on;
+@@ -28,7 +29,11 @@ struct pwm_beeper {
+ 
+ #define HZ_TO_NANOSECONDS(x) (1000000000UL/(x))
+ 
+-static int pwm_beeper_on(struct pwm_beeper *beeper, unsigned long period)
++/* Custom EV_SND code that sets the beep duty cycle (volume). */
++#define SND_VOLUME (SND_TONE + 1)
++
++static int pwm_beeper_on(struct pwm_beeper *beeper, unsigned long period,
++			 unsigned long duty)
+ {
+ 	struct pwm_state state;
+ 	int error;
+@@ -37,7 +42,7 @@ static int pwm_beeper_on(struct pwm_beeper *beeper, unsigned long period)
+ 
+ 	state.enabled = true;
+ 	state.period = period;
+-	pwm_set_relative_duty_cycle(&state, 50, 100);
++	pwm_set_relative_duty_cycle(&state, duty, 100);
+ 
+ 	error = pwm_apply_might_sleep(beeper->pwm, &state);
+ 	if (error)
+@@ -70,9 +75,10 @@ static void pwm_beeper_work(struct work_struct *work)
+ {
+ 	struct pwm_beeper *beeper = container_of(work, struct pwm_beeper, work);
+ 	unsigned long period = READ_ONCE(beeper->period);
++	unsigned long duty = READ_ONCE(beeper->duty);
+ 
+ 	if (period)
+-		pwm_beeper_on(beeper, period);
++		pwm_beeper_on(beeper, period, duty);
+ 	else
+ 		pwm_beeper_off(beeper);
+ }
+@@ -91,6 +97,10 @@ static int pwm_beeper_event(struct input_dev *input,
+ 		break;
+ 	case SND_TONE:
+ 		break;
++	case SND_VOLUME:
++		/* Duty cycle in percent. */
++		beeper->duty = value;
++		return 0;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -161,6 +171,7 @@ static int pwm_beeper_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	beeper->bell_frequency = bell_frequency;
++	beeper->duty = 50;
+ 
+ 	beeper->input = devm_input_allocate_device(dev);
+ 	if (!beeper->input) {
+@@ -177,6 +188,7 @@ static int pwm_beeper_probe(struct platform_device *pdev)
+ 
+ 	input_set_capability(beeper->input, EV_SND, SND_TONE);
+ 	input_set_capability(beeper->input, EV_SND, SND_BELL);
++	input_set_capability(beeper->input, EV_SND, SND_VOLUME);
+ 
+ 	beeper->input->event = pwm_beeper_event;
+ 	beeper->input->close = pwm_beeper_close;
+-- 
+2.43.0
+

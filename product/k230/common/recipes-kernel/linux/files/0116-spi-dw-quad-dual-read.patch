@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] spi: dw: add quad and dual reads on the dwc ssi
+
+Advertise SPI_TX/RX_DUAL and SPI_TX/RX_QUAD in mode_bits, and octal on
+DWC SSI (HSSI) controllers, so that spi-mem does not reject multi-lane
+operations.
+
+On HSSI controllers, add an enhanced spi-mem path for quad and dual
+DATA_IN operations, for example SPI-NAND read from cache x4 (0x6b): the
+command, address and dummy phases run on one lane and the data on four
+or two. The path uses TMOD_RO, so that ENH_CTRLR0.WAIT_CYCLES generates
+the dummy clocks, and transfer type TT0. The command is written to the
+FIFO before chip select and the address, packed LSB first, right after
+it. Multi-lane address phases and multi-lane writes are not supported
+and fall back to the single-lane path.
+
+Upstream-Status: Pending
+---
+ drivers/spi/spi-dw-core.c | 215 +++++++++++++++++++++++++++++++++++++-
+ drivers/spi/spi-dw.h      |  21 ++++
+ 2 files changed, 235 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/spi/spi-dw-core.c b/drivers/spi/spi-dw-core.c
+index 5b5cd73c3..511d8bdb9 100644
+--- a/drivers/spi/spi-dw-core.c
++++ b/drivers/spi/spi-dw-core.c
+@@ -3,6 +3,7 @@
+  * Designware SPI core controller driver (refer pxa2xx_spi.c)
+  *
+  * Copyright (c) 2009, Intel Corporation.
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
+  */
+ 
+ #include <linux/bitfield.h>
+@@ -751,6 +752,209 @@ static int dw_spi_exec_mem_op(struct spi_mem *mem, const struct spi_mem_op *op)
+ 	return ret;
+ }
+ 
++static bool dw_spi_supports_enh_mem_op(struct spi_mem *mem,
++				       const struct spi_mem_op *op)
++{
++	/* Multi-lane writes are not supported */
++	if (op->data.dir == SPI_MEM_DATA_OUT && op->data.buswidth > 1)
++		return false;
++
++	/*
++	 * TT0 only: cmd(1-bit) + addr(1-bit) + dummy(1-bit) + data(multi).
++	 * TT1/TT2 (QUADIO 0xEB) are not supported.
++	 */
++	if (op->addr.buswidth > 1)
++		return false;
++
++	/* Dummy bytes with TX not supported in enhanced read mode */
++	if (op->dummy.nbytes != 0 && op->data.dir == SPI_MEM_DATA_OUT)
++		return false;
++
++	/* WAIT_CYCLE field is 5 bits: max 31 SCK cycles */
++	if (op->dummy.nbytes != 0 &&
++	    op->dummy.nbytes * BITS_PER_BYTE /
++	    max(op->dummy.buswidth, (u8)1) > 31)
++		return false;
++
++	return spi_mem_default_supports_op(mem, op);
++}
++
++static int dw_spi_adjust_enh_mem_op_size(struct spi_mem *mem,
++					 struct spi_mem_op *op)
++{
++	op->data.nbytes = clamp_val(op->data.nbytes, 0, DW_SPI_NDF_MASK + 1);
++	return 0;
++}
++
++/*
++ * Build CMD+ADDR buffer for enhanced PIO reads.
++ *
++ * Layout: [0..reg_io_width-1]   opcode at byte 0, zero-padded
++ *         [reg_io_width..2w-1]  address bytes, LSB-first
++ *
++ * LSB-first packing: the DWC SSI address extractor reads
++ * bits [ADDR_L*4-1:0] of the 32-bit DR write, so byte 0 in the
++ * address word must carry the LSB of the column address.
++ */
++static void dw_spi_init_enh_mem_buf(struct dw_spi *dws,
++				    const struct spi_mem_op *op)
++{
++	unsigned int i;
++	u8 *out = dws->buf;
++
++	memset(out, 0, 2 * dws->reg_io_width);
++
++	/* CMD word: opcode in bits [7:0] */
++	out[0] = DW_SPI_GET_BYTE(op->cmd.opcode, 0);
++
++	/* ADDR word: LSB at lowest byte address */
++	for (i = 0; i < op->addr.nbytes; ++i)
++		out[dws->reg_io_width + i] = DW_SPI_GET_BYTE(op->addr.val, i);
++
++	dws->n_bytes = 1;
++	dws->tx = NULL;
++	dws->tx_len = 0;
++	if (op->data.dir == SPI_MEM_DATA_IN) {
++		dws->rx = op->data.buf.in;
++		dws->rx_len = op->data.nbytes;
++	} else {
++		dws->rx = NULL;
++		dws->rx_len = 0;
++	}
++}
++
++/* Drain RX FIFO with a hang-safety bound. */
++static int dw_spi_enh_drain_rx(struct dw_spi *dws)
++{
++	u8 *buf = dws->rx;
++	unsigned int len = dws->rx_len;
++	unsigned int idle = 0;
++	u32 entries;
++
++	while (len) {
++		entries = dw_readl(dws, DW_SPI_RXFLR);
++		if (!entries) {
++			if (++idle > 100000) {
++				dev_dbg(&dws->host->dev,
++					"enh RX stuck (idle=%u rem=%u)\n",
++					idle, len);
++				return -EIO;
++			}
++			continue;
++		}
++		idle = 0;
++		entries = min(entries, len);
++		for (; entries; --entries, --len)
++			*buf++ = dw_read_io_reg(dws, DW_SPI_DR);
++	}
++	return 0;
++}
++
++/*
++ * Enhanced SPI mem-op — DWC HSSI TT0 PIO path (K230 spi0).
++ *
++ * Handles QUAD (0x6B) and DUAL (0x3B) DATA_IN ops.
++ *
++ * Uses TMOD_RO so that ENH_CTRLR0.WAIT_CYCLES generates the dummy
++ * clocks automatically — EPROMREAD would require dummy bytes in the
++ * TX FIFO instead and does not honour WAIT_CYCLES.
++ *
++ * Sequence:
++ *   disable SSI → configure CTRLR0+ENH_CTRLR0+CTRLR1 → enable SSI
++ *   → pre-fill CMD word to DR → assert CS → write ADDR word → drain RX.
++ *
++ * All other ops fall back to dw_spi_exec_mem_op (single-lane).
++ */
++static int dw_spi_exec_enh_mem_op(struct spi_mem *mem,
++				  const struct spi_mem_op *op)
++{
++	struct dw_spi *dws = spi_controller_get_devdata(mem->spi->controller);
++	struct dw_spi_cfg cfg;
++	u32 cr0, enh_ctrlr0;
++	u8 spi_frf;
++	unsigned long flags;
++	int ret;
++
++	if (op->data.dir != SPI_MEM_DATA_IN || op->data.buswidth <= 1)
++		return dw_spi_exec_mem_op(mem, op);
++
++	switch (op->data.buswidth) {
++	case 4:
++		spi_frf = DW_SSI_CTRLR0_SPI_FRF_QUAD_SPI;
++		break;
++	case 2:
++		spi_frf = DW_SSI_CTRLR0_SPI_FRF_DUAL_SPI;
++		break;
++	default:
++		return dw_spi_exec_mem_op(mem, op);
++	}
++
++	dw_spi_init_enh_mem_buf(dws, op);
++
++	cfg.dfs = 8;
++	cfg.freq = clamp(mem->spi->max_speed_hz, 0U, dws->max_mem_freq);
++	/*
++	 * TMOD_RO: SSI reads CMD+ADDR from TX FIFO for the instruction and
++	 * address phases, then generates WAIT_CYCLES dummy clocks from
++	 * ENH_CTRLR0, then receives NDF data frames on the enhanced lines.
++	 * EPROMREAD does NOT use ENH_CTRLR0.WAIT_CYCLES and would require
++	 * dummy bytes in the TX FIFO — wrong for this path.
++	 */
++	cfg.tmode = DW_SPI_CTRLR0_TMOD_RO;
++	cfg.ndf = op->data.nbytes;
++
++	dw_spi_enable_chip(dws, 0);
++	dw_spi_update_config(dws, mem->spi, &cfg);
++
++	/* Activate enhanced SPI frame format in CTRLR0[23:22] */
++	cr0 = dw_readl(dws, DW_SPI_CTRLR0);
++	cr0 |= FIELD_PREP(DW_HSSI_CTRLR0_SPI_FRF_MASK, spi_frf);
++	dw_writel(dws, DW_SPI_CTRLR0, cr0);
++
++	/*
++	 * TT0: cmd(1-bit) + addr(1-bit) + dummy(1-bit) + data(4-bit).
++	 * WAIT_CYCLES = dummy.nbytes * 8 / dummy.buswidth clock cycles.
++	 * For QUAD (0x6B): 1 dummy byte at 1-bit = 8 SCK cycles.
++	 */
++	enh_ctrlr0 =
++		FIELD_PREP(DW_SPI_ENH_CTRLR0_INST_MASK, DW_SPI_ENH_CTRLR0_INST_L8) |
++		FIELD_PREP(DW_SPI_ENH_CTRLR0_ADDR_MASK, op->addr.nbytes * 2) |
++		FIELD_PREP(DW_SPI_ENH_CTRLR0_WAIT_MASK,
++			   op->dummy.nbytes
++			   ? op->dummy.nbytes * BITS_PER_BYTE /
++			     max(op->dummy.buswidth, (u8)1)
++			   : 0) |
++		FIELD_PREP(DW_SPI_ENH_CTRLR0_TT_MASK, DW_SPI_ENH_CTRLR0_TT0);
++	dw_writel(dws, DW_SPI_ENH_CTRLR0, enh_ctrlr0);
++
++	dw_spi_mask_intr(dws, 0xff);
++	dw_spi_enable_chip(dws, 1);
++
++	local_irq_save(flags);
++	preempt_disable();
++
++	/* Pre-fill CMD before CS; write ADDR after CS while instruction clocks */
++	dw_write_io_reg(dws, DW_SPI_DR, *(u32 *)(dws->buf));
++	dw_spi_set_cs(mem->spi, false);
++	if (op->addr.nbytes)
++		dw_write_io_reg(dws, DW_SPI_DR,
++				*(u32 *)(dws->buf + dws->reg_io_width));
++
++	ret = dw_spi_enh_drain_rx(dws);
++
++	local_irq_restore(flags);
++	preempt_enable();
++
++	if (!ret) {
++		ret = dw_spi_wait_mem_op_done(dws);
++		if (!ret)
++			ret = dw_spi_check_status(dws, true);
++	}
++
++	dw_spi_stop_mem_op(dws, mem->spi);
++	return ret;
++}
++
+ /*
+  * Initialize the default memory operations if a glue layer hasn't specified
+  * custom ones. Direct mapping operations will be preserved anyway since DW SPI
+@@ -767,6 +971,12 @@ static void dw_spi_init_mem_ops(struct dw_spi *dws)
+ 		dws->mem_ops.adjust_op_size = dw_spi_adjust_mem_op_size;
+ 		dws->mem_ops.supports_op = dw_spi_supports_mem_op;
+ 		dws->mem_ops.exec_op = dw_spi_exec_mem_op;
++		if (dw_spi_ip_is(dws, HSSI)) {
++			dws->mem_ops.adjust_op_size =
++				dw_spi_adjust_enh_mem_op_size;
++			dws->mem_ops.supports_op = dw_spi_supports_enh_mem_op;
++			dws->mem_ops.exec_op = dw_spi_exec_enh_mem_op;
++		}
+ 		if (!dws->max_mem_freq)
+ 			dws->max_mem_freq = dws->max_freq;
+ 	}
+@@ -928,7 +1138,10 @@ int dw_spi_add_host(struct device *dev, struct dw_spi *dws)
+ 	dw_spi_init_mem_ops(dws);
+ 
+ 	host->use_gpio_descriptors = true;
+-	host->mode_bits = SPI_CPOL | SPI_CPHA | SPI_LOOP;
++	host->mode_bits = SPI_CPOL | SPI_CPHA | SPI_LOOP | SPI_TX_DUAL |
++			  SPI_RX_DUAL | SPI_TX_QUAD | SPI_RX_QUAD;
++	if (dw_spi_ip_is(dws, HSSI))
++		host->mode_bits |= SPI_TX_OCTAL | SPI_RX_OCTAL;
+ 	if (dws->caps & DW_SPI_CAP_DFS32)
+ 		host->bits_per_word_mask = SPI_BPW_RANGE_MASK(4, 32);
+ 	else
+diff --git a/drivers/spi/spi-dw.h b/drivers/spi/spi-dw.h
+index 6ce2999e1..dd8d93b53 100644
+--- a/drivers/spi/spi-dw.h
++++ b/drivers/spi/spi-dw.h
+@@ -96,6 +96,27 @@
+ #define DW_HSSI_CTRLR0_SRL			BIT(13)
+ #define DW_HSSI_CTRLR0_MST			BIT(31)
+ 
++/* DWC SSI Enhanced SPI Frame Format — CTRLR0[23:22] (HSSI only) */
++#define DW_HSSI_CTRLR0_SPI_FRF_MASK		GENMASK(23, 22)
++#define DW_SSI_CTRLR0_SPI_FRF_DUAL_SPI		0x1
++#define DW_SSI_CTRLR0_SPI_FRF_QUAD_SPI		0x2
++
++/*
++ * DW_SPI_ENH_CTRLR0 (0xf4) — Enhanced SPI Control Register (DWC SSI / HSSI).
++ * The same offset is DW_SPI_CS_OVERRIDE on a different SoC variant; the two
++ * uses are guarded by separate caps bits and do not conflict on K230.
++ */
++#define DW_SPI_ENH_CTRLR0			0xf4
++#define DW_SPI_ENH_CTRLR0_WAIT_MASK		GENMASK(15, 11)	/* wait cycles */
++#define DW_SPI_ENH_CTRLR0_INST_MASK		GENMASK(9, 8)	/* instruction length */
++#define DW_SPI_ENH_CTRLR0_INST_L0		0x0		/* no instruction */
++#define DW_SPI_ENH_CTRLR0_INST_L8		0x2		/* 8-bit instruction */
++#define DW_SPI_ENH_CTRLR0_ADDR_MASK		GENMASK(5, 2)	/* addr length (nibbles) */
++#define DW_SPI_ENH_CTRLR0_TT_MASK		GENMASK(1, 0)	/* transfer type */
++#define DW_SPI_ENH_CTRLR0_TT0			0x0		/* std cmd+addr, multi data */
++#define DW_SPI_ENH_CTRLR0_TT1			0x1		/* std cmd, multi addr+data */
++#define DW_SPI_ENH_CTRLR0_TT2			0x2		/* all multi */
++
+ /* Bit fields in CTRLR1 */
+ #define DW_SPI_NDF_MASK				GENMASK(15, 0)
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] watchdog: dw_wdt: signal the pre-timeout owner with SIGUSR2
+
+A supervisor process needs the pre-timeout delivered to userspace so
+that it can record a watchdog boot reason and reboot cleanly instead of
+being cut down by the hardware reset with no record. dw_wdt routes the
+pre-timeout only into the in-kernel governors (pretimeout_noop,
+pretimeout_panic), neither of which reaches a process, and the watchdog
+core has no .poll, .fasync or F_SETOWN path on /dev/watchdog.
+
+The process that issues WDIOC_SETPRETIMEOUT with a non-zero value
+becomes the signal target, and dw_wdt_irq() sends it SIGUSR2, drops
+back to reset response mode and acknowledges the interrupt through the
+EOI register. No new ioctl is needed. The process blocks SIGUSR2 in
+every thread before it issues the ioctl, and one thread collects the
+signal with sigtimedwait() and reboots in thread context.
+
+ - The target is held as a reference-counted struct pid, not a task
+   pointer, so it cannot dangle when the registering thread exits.
+   kill_pid() is thread-group directed, so the signal stays pending for
+   whichever thread waits for it.
+
+   The reference is not taken or dropped in dw_wdt_update_mode(), which
+   dw_wdt_restart() also calls after panic() and smp_send_stop() have
+   stopped the other harts: put_pid() can reach kmem_cache_free() and
+   SLUB's per-node list_lock, and a stopped hart holding that lock would
+   hang the reboot. The callers that mean it take and drop it instead:
+   dw_wdt_set_pretimeout() (arm and disarm), dw_wdt_stop(), dw_wdt_irq()
+   (which consumes it) and dw_wdt_drv_remove(). dw_wdt_restart() and
+   probe touch no allocator.
+
+ - A spinlock covers the pointer, which the ioctl path writes and the
+   hard interrupt reads, and the response-mode read-modify-write of
+   WDOG_CONTROL that both paths perform. kill_pid() with priv = 1 sends SEND_SIG_PRIV,
+   which skips the permission check against whatever task the interrupt
+   preempted. The reference is taken out under the lock and the signal
+   sent outside it, so no sighand lock nests under it.
+
+ - watchdog_notify_pretimeout() is kept, so every other dw_wdt board
+   keeps its governor behaviour.
+
+Acknowledging the interrupt (the WDOG_INTERRUPT_CLEAR_REG_OFFSET read)
+is required. The K230 PLIC binds as thead,c900-plic, whose edge quirk
+honours the IRQF_TRIGGER_RISING that dw_wdt requests and completes the
+interrupt before the handler runs. A handler that returns with WDT_STAT
+still asserted lets the source latch again, the PLIC claim loop never
+drains, and the hart spins with interrupts off until the second timeout
+period resets the SoC. Any process that arms the pre-timeout therefore
+needs this acknowledge, signal target or not.
+
+Boards that never issue WDIOC_SETPRETIMEOUT see no change apart from
+the mode drop-back and the acknowledge in the interrupt path. Where the
+pre-timeout is armed, the DesignWare two-stage deadline is unchanged:
+SIGUSR2 after one timeout period, SoC reset after two, reached by
+re-arming reset response mode instead of leaving the interrupt latched.
+
+Upstream-Status: Pending
+---
+ drivers/watchdog/dw_wdt.c | 71 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 67 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/watchdog/dw_wdt.c b/drivers/watchdog/dw_wdt.c
+index 2e1d2f53a..dda663f5a 100644
+--- a/drivers/watchdog/dw_wdt.c
++++ b/drivers/watchdog/dw_wdt.c
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright 2010-2011 Picochip Ltd., Jamie Iles
+  * https://www.picochip.com
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
+  *
+  * This file implements a driver for the Synopsys DesignWare watchdog device
+  * in the many subsystems. The watchdog has 16 different timeout periods
+@@ -24,9 +25,12 @@
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/of.h>
++#include <linux/pid.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm.h>
+ #include <linux/reset.h>
++#include <linux/sched/signal.h>
++#include <linux/spinlock.h>
+ #include <linux/watchdog.h>
+ #include <linux/firmware/xuantie/th1520_event.h>
+ 
+@@ -96,6 +100,9 @@ struct dw_wdt {
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry		*dbgfs_dir;
+ #endif
++	/* Serialises sig_pid and the response mode against the pre-timeout IRQ. */
++	spinlock_t		sig_lock;
++	struct pid		*sig_pid;
+ };
+ 
+ #define to_dw_wdt(wdd)	container_of(wdd, struct dw_wdt, wdd)
+@@ -106,6 +113,36 @@ static inline int dw_wdt_is_enabled(struct dw_wdt *dw_wdt)
+ 		WDOG_CONTROL_REG_WDT_EN_MASK;
+ }
+ 
++static void dw_wdt_set_sig_pid(struct dw_wdt *dw_wdt, struct pid *pid)
++{
++	unsigned long flags;
++	struct pid *old;
++
++	spin_lock_irqsave(&dw_wdt->sig_lock, flags);
++	old = dw_wdt->sig_pid;
++	dw_wdt->sig_pid = pid;
++	spin_unlock_irqrestore(&dw_wdt->sig_lock, flags);
++
++	put_pid(old);
++}
++
++/* Consumes the registration: the target must re-arm to be signalled again. */
++static void dw_wdt_signal_pretimeout(struct dw_wdt *dw_wdt)
++{
++	unsigned long flags;
++	struct pid *pid;
++
++	spin_lock_irqsave(&dw_wdt->sig_lock, flags);
++	pid = dw_wdt->sig_pid;
++	dw_wdt->sig_pid = NULL;
++	spin_unlock_irqrestore(&dw_wdt->sig_lock, flags);
++
++	if (pid) {
++		kill_pid(pid, SIGUSR2, 1);
++		put_pid(pid);
++	}
++}
++
+ static void dw_wdt_update_mode(struct dw_wdt *dw_wdt, enum dw_wdt_rmod rmod)
+ {
+ 	u32 val;
+@@ -251,8 +288,21 @@ static int dw_wdt_set_pretimeout(struct watchdog_device *wdd, unsigned int req)
+ 	 * We ignore actual value of the timeout passed from user-space
+ 	 * using it as a flag whether the pretimeout functionality is intended
+ 	 * to be activated.
++	 *
++	 * The caller becomes the signal target. Register before arming and
++	 * unregister after disarming, so the IRQ can never find response mode
++	 * enabled with no target, nor a stale target after it was revoked.
+ 	 */
++	if (req)
++		dw_wdt_set_sig_pid(dw_wdt, get_pid(task_tgid(current)));
++
++	spin_lock_irq(&dw_wdt->sig_lock);
+ 	dw_wdt_update_mode(dw_wdt, req ? DW_WDT_RMOD_IRQ : DW_WDT_RMOD_RESET);
++	spin_unlock_irq(&dw_wdt->sig_lock);
++
++	if (!req)
++		dw_wdt_set_sig_pid(dw_wdt, NULL);
++
+ 	dw_wdt_set_timeout(wdd, wdd->timeout);
+ 
+ 	return 0;
+@@ -287,6 +337,8 @@ static int dw_wdt_stop(struct watchdog_device *wdd)
+ {
+ 	struct dw_wdt *dw_wdt = to_dw_wdt(wdd);
+ 
++	dw_wdt_set_sig_pid(dw_wdt, NULL);
++
+ 	if (!dw_wdt->rst) {
+ 		set_bit(WDOG_HW_RUNNING, &wdd->status);
+ 		return 0;
+@@ -363,15 +415,23 @@ static irqreturn_t dw_wdt_irq(int irq, void *devid)
+ 	struct dw_wdt *dw_wdt = devid;
+ 	u32 val;
+ 
+-	/*
+-	 * We don't clear the IRQ status. It's supposed to be done by the
+-	 * following ping operations.
+-	 */
+ 	val = readl(dw_wdt->regs + WDOG_INTERRUPT_STATUS_REG_OFFSET);
+ 	if (!val)
+ 		return IRQ_NONE;
+ 	th1520_event_set_rebootmode(TH1520_EVENT_SW_WATCHDOG);
+ 
++	dw_wdt_signal_pretimeout(dw_wdt);
++	/*
++	 * Drop back to reset response mode before acknowledging, so the next
++	 * TOP resets the SoC instead of raising a second pre-timeout IRQ.
++	 * Reading the EOI register clears the interrupt status; on a PLIC that
++	 * acks before the handler (thead,c900-plic, handle_edge_irq) leaving it
++	 * asserted lets the source re-latch and the claim loop never drains.
++	 */
++	spin_lock(&dw_wdt->sig_lock);
++	dw_wdt_update_mode(dw_wdt, DW_WDT_RMOD_RESET);
++	spin_unlock(&dw_wdt->sig_lock);
++	readl(dw_wdt->regs + WDOG_INTERRUPT_CLEAR_REG_OFFSET);
+ 	watchdog_notify_pretimeout(&dw_wdt->wdd);
+ 
+ 	return IRQ_HANDLED;
+@@ -558,6 +618,8 @@ static int dw_wdt_drv_probe(struct platform_device *pdev)
+ 	if (!dw_wdt)
+ 		return -ENOMEM;
+ 
++	spin_lock_init(&dw_wdt->sig_lock);
++
+ 	dw_wdt->regs = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(dw_wdt->regs))
+ 		return PTR_ERR(dw_wdt->regs);
+@@ -673,6 +735,7 @@ static void dw_wdt_drv_remove(struct platform_device *pdev)
+ 	dw_wdt_dbgfs_clear(dw_wdt);
+ 
+ 	watchdog_unregister_device(&dw_wdt->wdd);
++	dw_wdt_set_sig_pid(dw_wdt, NULL);
+ 	reset_control_assert(dw_wdt->rst);
+ }
+ 
+-- 
+2.43.0
+

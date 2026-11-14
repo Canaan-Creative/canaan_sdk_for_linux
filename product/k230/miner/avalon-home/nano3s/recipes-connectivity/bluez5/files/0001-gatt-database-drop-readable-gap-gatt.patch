@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] gatt-database: drop readable GAP/GATT characteristics
+
+The Avalon phone app addresses the provisioning characteristics by index
+into the discovery-ordered list of readable characteristics, not by UUID:
+read index 0 on iOS or 1 on Android for the Wi-Fi scan list, and
+write-with-response index 0 for commands. It expects exactly one readable
+characteristic, GAP 0x2a00 Device Name, ahead of the 0xffff provisioning
+service. bluetoothd publishes six, so on Android, which enumerates 0x1800
+and 0x1801, the app reads GAP Appearance instead of the scan list and
+writes its scan command to GATT Client Supported Features instead of
+0xffe2, and the Wi-Fi list stays empty. iOS does not expose those two
+services to applications and is not affected.
+
+main.conf DeviceID=false removes DIS 0x180a/PnP and GATT Channels=1
+removes EATT 0x2b3a. The remaining four have no config switch and are
+dropped here:
+
+  GAP  0x2a01 Appearance
+  GAP  0x2aa6 Central Address Resolution
+  GATT 0x2b29 Client Supported Features
+  GATT 0x2b2a Database Hash
+
+0x2a05 Service Changed is indicate-only, not readable, and is kept, so
+cache invalidation still works through the pre-5.1 mechanism; without
+0x2b29 and 0x2b2a robust caching is not offered. database->cli_feat and
+database->db_hash have no other reader, and get_dst_info,
+find_device_state and get_device_state keep callers outside the removed
+functions.
+
+Upstream-Status: Pending
+
+--- a/src/gatt-database.c
++++ b/src/gatt-database.c
+@@ -690,43 +690,6 @@
+ 	gatt_db_attribute_read_result(attrib, id, error, value, len);
+ }
+ 
+-static void gap_appearance_read_cb(struct gatt_db_attribute *attrib,
+-					unsigned int id, uint16_t offset,
+-					uint8_t opcode, struct bt_att *att,
+-					void *user_data)
+-{
+-	struct btd_gatt_database *database = user_data;
+-	uint8_t error = 0;
+-	size_t len = 2;
+-	const uint8_t *value = NULL;
+-	uint8_t appearance[2];
+-	uint32_t dev_class;
+-
+-	DBG("GAP Appearance read request\n");
+-
+-	dev_class = btd_adapter_get_class(database->adapter);
+-
+-	appearance[0] = dev_class & 0x00ff;
+-	appearance[1] = (dev_class >> 8) & 0x001f;
+-
+-	len -= offset;
+-	value = len ? &appearance[offset] : NULL;
+-
+-	gatt_db_attribute_read_result(attrib, id, error, value, len);
+-}
+-
+-static void gap_car_read_cb(struct gatt_db_attribute *attrib,
+-					unsigned int id, uint16_t offset,
+-					uint8_t opcode, struct bt_att *att,
+-					void *user_data)
+-{
+-	uint8_t value = 0x01;
+-
+-	DBG("GAP Central Address Resolution read request\n");
+-
+-	gatt_db_attribute_read_result(attrib, id, 0, &value, sizeof(value));
+-}
+-
+ static sdp_record_t *record_new(uuid_t *uuid, uint16_t start, uint16_t end)
+ {
+ 	sdp_list_t *svclass_id, *apseq, *proto[2], *root, *aproto;
+@@ -844,7 +807,7 @@
+ static void populate_gap_service(struct btd_gatt_database *database)
+ {
+ 	bt_uuid_t uuid;
+-	struct gatt_db_attribute *service, *attrib;
++	struct gatt_db_attribute *service;
+ 
+ 	/* Add the GAP service */
+ 	bt_uuid16_create(&uuid, UUID_GAP);
+@@ -859,28 +822,6 @@
+ 							gap_device_name_read_cb,
+ 							NULL, database);
+ 
+-	/*
+-	 * Device Appearance characteristic.
+-	 */
+-	bt_uuid16_create(&uuid, GATT_CHARAC_APPEARANCE);
+-	attrib = gatt_db_service_add_characteristic(service, &uuid,
+-							BT_ATT_PERM_READ,
+-							BT_GATT_CHRC_PROP_READ,
+-							gap_appearance_read_cb,
+-							NULL, database);
+-	gatt_db_attribute_set_fixed_length(attrib, 2);
+-
+-	/*
+-	 * Central Address Resolution characteristic.
+-	 */
+-	bt_uuid16_create(&uuid, GATT_CHARAC_CAR);
+-	attrib = gatt_db_service_add_characteristic(service, &uuid,
+-							BT_ATT_PERM_READ,
+-							BT_GATT_CHRC_PROP_READ,
+-							gap_car_read_cb,
+-							NULL, database);
+-	gatt_db_attribute_set_fixed_length(attrib, 1);
+-
+ 	gatt_db_service_set_active(service, true);
+ 
+ 	database_add_record(database, service);
+@@ -1101,106 +1042,6 @@
+ 	return ccc;
+ }
+ 
+-static void cli_feat_read_cb(struct gatt_db_attribute *attrib,
+-					unsigned int id, uint16_t offset,
+-					uint8_t opcode, struct bt_att *att,
+-					void *user_data)
+-{
+-	struct btd_gatt_database *database = user_data;
+-	struct device_state *state;
+-	uint8_t ecode = 0;
+-	const uint8_t *value = NULL;
+-	size_t len = 0;
+-
+-	DBG("Client Features read");
+-
+-	state = get_device_state(database, att);
+-	if (!state) {
+-		ecode = BT_ATT_ERROR_UNLIKELY;
+-		goto done;
+-	}
+-
+-	len = sizeof(state->cli_feat) - offset;
+-	value = len ? &state->cli_feat[offset] : NULL;
+-
+-done:
+-	gatt_db_attribute_read_result(attrib, id, ecode, value, len);
+-}
+-
+-static void cli_feat_write_cb(struct gatt_db_attribute *attrib,
+-					unsigned int id, uint16_t offset,
+-					const uint8_t *value, size_t len,
+-					uint8_t opcode, struct bt_att *att,
+-					void *user_data)
+-{
+-	struct btd_gatt_database *database = user_data;
+-	struct device_state *state;
+-	uint8_t bits[] = { BT_GATT_CHRC_CLI_FEAT_ROBUST_CACHING,
+-				BT_GATT_CHRC_CLI_FEAT_EATT,
+-				BT_GATT_CHRC_CLI_FEAT_NFY_MULTI };
+-	uint8_t ecode = 0;
+-	unsigned int i;
+-
+-	DBG("Client Features write");
+-
+-	state = get_device_state(database, att);
+-	if (!state) {
+-		ecode = BT_ATT_ERROR_UNLIKELY;
+-		goto done;
+-	}
+-
+-	if (!value || !len) {
+-		ecode = BT_ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LEN;
+-		goto done;
+-	}
+-
+-	for (i = 0; i < sizeof(bits); i++) {
+-		/* A client shall never clear a bit it has set */
+-		if (state->cli_feat[0] & (1 << i) && !(value[0] & (1 << i))) {
+-			ecode = BT_ATT_ERROR_VALUE_NOT_ALLOWED;
+-			goto done;
+-		}
+-	}
+-
+-	/* Shall we reallocate the feat array if bigger? */
+-	len = MIN(sizeof(state->cli_feat), len);
+-	while (len) {
+-		state->cli_feat[len - 1] |= value[len - 1];
+-		len--;
+-	}
+-
+-	state->cli_feat[0] &= ((1 << sizeof(bits)) - 1);
+-	state->change_aware = true;
+-
+-done:
+-	gatt_db_attribute_write_result(attrib, id, ecode);
+-}
+-
+-static void db_hash_read_cb(struct gatt_db_attribute *attrib,
+-					unsigned int id, uint16_t offset,
+-					uint8_t opcode, struct bt_att *att,
+-					void *user_data)
+-{
+-	struct btd_gatt_database *database = user_data;
+-	const uint8_t *hash;
+-	struct device_state *state;
+-	bdaddr_t bdaddr;
+-	uint8_t bdaddr_type;
+-
+-	DBG("Database Hash read");
+-
+-	hash = gatt_db_get_hash(database->db);
+-
+-	gatt_db_attribute_read_result(attrib, id, 0, hash, 16);
+-
+-	if (!get_dst_info(att, &bdaddr, &bdaddr_type))
+-		return;
+-
+-	state = find_device_state(database, &bdaddr, bdaddr_type);
+-	if (state)
+-		state->change_aware = true;
+-}
+-
+ static void server_feat_read_cb(struct gatt_db_attribute *attrib,
+ 					unsigned int id, uint16_t offset,
+ 					uint8_t opcode, struct bt_att *att,
+@@ -1240,25 +1081,6 @@
+ 	database->svc_chngd_ccc = service_add_ccc(service, database, NULL, NULL,
+ 								    0, NULL);
+ 
+-	bt_uuid16_create(&uuid, GATT_CHARAC_CLI_FEAT);
+-	database->cli_feat = gatt_db_service_add_characteristic(service,
+-				&uuid, BT_ATT_PERM_READ | BT_ATT_PERM_WRITE,
+-				BT_GATT_CHRC_PROP_READ |
+-				BT_GATT_CHRC_PROP_WRITE,
+-				cli_feat_read_cb, cli_feat_write_cb,
+-				database);
+-
+-	gatt_db_attribute_set_fixed_length(database->cli_feat, CLI_FEAT_SIZE);
+-
+-	/* Only expose database hash chrc if supported */
+-	if (gatt_db_hash_support(database->db)) {
+-		bt_uuid16_create(&uuid, GATT_CHARAC_DB_HASH);
+-		database->db_hash = gatt_db_service_add_characteristic(service,
+-				&uuid, BT_ATT_PERM_READ, BT_GATT_CHRC_PROP_READ,
+-				db_hash_read_cb, NULL, database);
+-		gatt_db_attribute_set_fixed_length(database->db_hash, 16);
+-	}
+-
+ 	/* Only enable EATT if there is a socket listening */
+ 	if (database->eatt_io) {
+ 		bt_uuid16_create(&uuid, GATT_CHARAC_SERVER_FEAT);

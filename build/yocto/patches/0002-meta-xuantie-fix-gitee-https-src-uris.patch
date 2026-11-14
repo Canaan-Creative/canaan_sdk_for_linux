@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] meta-xuantie: fix SRC_URIs that combine git@ with protocol=https
+
+Fix SRC_URI entries that combine SSH user syntax (git@) with protocol=https.
+The git@ prefix is SSH-only; using it with protocol=https produces an
+authenticated HTTPS URL that fails without credentials.
+
+Modified by Canaan Creative Co., Ltd.
+
+Upstream-Status: Pending
+
+--- a/recipes-graphics/glm/glm_0.9.9.8.bbappend
++++ b/recipes-graphics/glm/glm_0.9.9.8.bbappend
+@@ -1,6 +1,6 @@
+ 
+ SRC_URI = " \
+-    git://git@gitee.com/t-head-linux/glm.git;branch=master;protocol=https \
++    git://gitee.com/t-head-linux/glm.git;branch=master;protocol=https \
+     file://0001-Silence-clang-warnings.patch \
+     file://glmConfig.cmake.in \
+     file://glmConfigVersion.cmake.in \
+--- a/recipes-graphics/vulkan/assimp_5.0.1.bbappend
++++ b/recipes-graphics/vulkan/assimp_5.0.1.bbappend
+@@ -1,4 +1,4 @@
+-SRC_URI = "git://git@gitee.com/t-head-linux/assimp.git;branch=assimp_5.0_release;protocol=https \
++SRC_URI = "git://gitee.com/t-head-linux/assimp.git;branch=assimp_5.0_release;protocol=https \
+            file://0001-closes-https-github.com-assimp-assimp-issues-2733-up.patch \
+            file://0001-Use-ASSIMP_LIB_INSTALL_DIR-to-search-library.patch \
+            "
+--- a/recipes-support/glog/glog_0.5.0.bbappend
++++ b/recipes-support/glog/glog_0.5.0.bbappend
+@@ -1,6 +1,6 @@
+ 
+ SRC_URI = " \
+-    git://git@gitee.com/t-head-linux/glog.git;nobranch=1;protocol=https \
++    git://gitee.com/t-head-linux/glog.git;nobranch=1;protocol=https \
+     file://libexecinfo.patch \
+ "
+ 

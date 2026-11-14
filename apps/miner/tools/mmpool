@@ -1,0 +1,826 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026, Canaan Creative Co., Ltd.
+#
+# For the licensing terms, see the LICENSE file (MIT License).
+#
+# NO WARRANTY. The Software is provided "AS IS", without warranty of any kind, express or
+# implied, including but not limited to the warranties of merchantability, fitness for a
+# particular purpose and non-infringement. In no event shall the authors or copyright
+# holders be liable for any claim, damages or other liability arising from, out of or in
+# connection with the Software or the use or other dealings in the Software.
+
+set -euo pipefail
+export LC_ALL=C
+
+usage()
+{
+    cat <<'EOF'
+mmpool -c <pools.conf> [options] <ip>...
+mmpool -c <pools.conf> [options] --hosts <file>
+
+Sets the pools of one or more Nano3s miners over https://<ip>:8443/api/v1, reboots them so the
+pools take effect and checks on TCP :4028 that they mine.
+
+Pool file: one pool per line, at most 3; line n goes into slot n-1. '#' starts a comment.
+    <url> <worker> [<password>]
+    stratum+tcp://pool.example.com:3333 acct.001 x
+A line without a password takes $MMPOOL_POOL_PASS. No field may be empty or hold a space, ',',
+'"', '|', '\' or a control character; <url> ends in :<port>; at most 256/128/128 bytes.
+
+Hosts file (--hosts): one IP or host name per line, '#' starts a comment.
+
+Options:
+  -c, --config FILE      pool file (required)
+      --hosts FILE       read devices from FILE as well as from the arguments
+  -j, --jobs N           devices handled at once (default 8)
+      --keep-unused      leave the slots past the last pool line as they are (default: clear them)
+      --force            write even when the running pools already match
+      --no-reboot        do not reboot; the pools take effect at the next reboot, and are not
+                         checked. A device that runs no pool takes them within 10 s and is
+                         never rebooted.
+      --reboot-delay N   reboot delay, 0..300 s (default 0)
+      --no-verify        do not check the pools on :4028
+      --verify-timeout S give up the check after S seconds (default 300)
+      --verify-interval S poll :4028 every S seconds (default 10)
+      --enable-disabled  enable a listed pool the miner runs as Disabled (default: warn only)
+      --wait-lock        when the login is locked (HTTP 429), wait $MMPOOL_LOCK_WAIT s
+                         (default 61) and try once more (default: fail)
+      --pin PIN|FILE     check the device key with curl --pinnedpubkey: 'sha256//<base64>' for
+                         every device, or a file of '<ip> sha256//<base64>' lines
+      --rest-port N      HTTPS port (default 8443)
+      --fallback-port N  when the HTTPS port refuses the connection, use port N (443 serves
+                         /api/v1 when 8443 cannot be opened); default: no fallback
+      --api-port N       read port (default 4028)
+      --timeout S        timeout of one HTTPS request (default 10)
+      --dry-run          check the pool file and print the plan, send nothing
+  -h, --help             this text
+
+Environment:
+  $MMPOOL_PASS (else $MMUPGRADE_PASS)  web password; asked on the terminal when unset
+  $MMPOOL_USER (else $MMUPGRADE_USER)  web user (default admin)
+  $MMPOOL_POOL_PASS                    pool password of lines that give none
+
+Passwords are never taken from the command line. The certificate is not checked unless --pin is
+given: on an untrusted network, someone in the path can take the web password and the token.
+
+Match: the miner cannot report its saved pools, only the running ones (:4028 pools, without
+passwords). A device whose running pools have the URL and worker of the pool file is skipped;
+use --force after changing only a password, or to rewrite saved pools not yet in effect.
+
+Check: after the reboot, every listed pool runs, no other pool does, and a listed pool that is
+Alive and Stratum Active raises its Accepted count between two polls.
+
+Exit: 0 all devices done or skipped, 1 a device failed, 2 usage or pool file error (nothing
+sent), 3 the pools were set but the check failed.
+EOF
+}
+
+die_usage()
+{
+    printf 'mmpool: %s\n' "$1" >&2
+    echo "try 'mmpool -h'" >&2
+    exit 2
+}
+
+json_str()
+{
+    local s=$1 out='' c i
+
+    for ((i = 0; i < ${#s}; i++))
+    do
+        c=${s:i:1}
+        case $c in
+        \\ | \") out+="\\$c" ;;
+        $'\t') out+='\t' ;;
+        $'\n') out+='\n' ;;
+        $'\r') out+='\r' ;;
+        [$'\x01'-$'\x1f']) out+=$(printf '\\u%04x' "'$c") ;;
+        *) out+=$c ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+cfg_str()
+{
+    local s=${1//\\/\\\\}
+
+    printf '%s' "${s//\"/\\\"}"
+}
+
+# Msg of a reply with any password masked; never the reply itself, as the setpool reply
+# carries the pool password.
+reply_msg()
+{
+    local re='"Msg":"([^"]*)"' m s
+
+    if [[ $1 =~ $re ]]
+    then
+        m=${BASH_REMATCH[1]}
+    else
+        printf 'no Msg\n'
+        return
+    fi
+    if [[ $m == *'workerpassword is'* ]]
+    then
+        m="${m%%workerpassword is*}workerpassword is ***"
+    fi
+    for s in "${secrets[@]}"
+    do
+        if [ ${#s} -ge 4 ]
+        then
+            m=${m//"$s"/***}
+        fi
+    done
+    printf '%s\n' "$m"
+}
+
+reply_code()
+{
+    local re='"Code":([0-9]+)'
+
+    if [[ $1 =~ $re ]]
+    then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        printf '-'
+    fi
+}
+
+reply_status()
+{
+    local re='"STATUS":"([A-Z])"'
+
+    if [[ $1 =~ $re ]]
+    then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+is_num()
+{
+    [[ $1 =~ ^[0-9]+$ ]] && [ ${#1} -le 6 ]
+}
+
+check_field()
+{
+    if [ -z "$2" ]
+    then
+        echo "empty $1"
+        return 1
+    fi
+    if [ ${#2} -gt "$3" ]
+    then
+        echo "$1 longer than $3 bytes"
+        return 1
+    fi
+    if [[ $2 == *[$'\x01'-$'\x20'$'\x7f'\",\|\\]* ]]
+    then
+        printf '%s holds a space, %s or a control character\n' "$1" "',', '\"', '|', '\\'"
+        return 1
+    fi
+}
+
+check_url()
+{
+    local re='^([A-Za-z][A-Za-z0-9+.-]*://)?(.+):([0-9]{1,5})$'
+
+    check_field url "$1" 256 || return 1
+    if ! [[ $1 =~ $re ]] || [ $((10#${BASH_REMATCH[3]})) -lt 1 ] ||
+        [ $((10#${BASH_REMATCH[3]})) -gt 65535 ]
+    then
+        echo "url is not [<scheme>://]<host>:<port> with a port 1..65535"
+        return 1
+    fi
+}
+
+read_config()
+{
+    local f=$1 line n=0 err url worker pw rest
+
+    [ -r "$f" ] || die_usage "cannot read pool file $f"
+    while IFS= read -r line || [ -n "$line" ]
+    do
+        n=$((n + 1))
+        line=${line%%#*}
+        read -r url worker pw rest <<<"$line" || true
+        [ -n "$url" ] || continue
+        [ -z "$rest" ] || die_usage "$f:$n: more than 3 fields"
+        [ -n "$worker" ] || die_usage "$f:$n: no worker"
+        pw=${pw:-$pool_pass_env}
+        [ -n "$pw" ] || die_usage "$f:$n: no password and \$MMPOOL_POOL_PASS is unset"
+        err=$(check_url "$url") || die_usage "$f:$n: $err"
+        err=$(check_field worker "$worker" 128) || die_usage "$f:$n: $err"
+        err=$(check_field password "$pw" 128) || die_usage "$f:$n: $err"
+        [ ${#t_url[@]} -lt 3 ] || die_usage "$f:$n: more than 3 pools"
+        t_url+=("$url")
+        t_user+=("$worker")
+        t_pass+=("$pw")
+        secrets+=("$pw")
+    done <"$f"
+    [ ${#t_url[@]} -gt 0 ] || die_usage "$f: no pool"
+    if [ -n "$(find "$f" -maxdepth 0 -perm /077 2>/dev/null)" ]
+    then
+        echo "mmpool: warning: $f is readable by others; chmod 600 it" >&2
+    fi
+}
+
+read_hosts()
+{
+    local line h
+
+    [ -r "$1" ] || die_usage "cannot read hosts file $1"
+    while IFS= read -r line || [ -n "$line" ]
+    do
+        line=${line%%#*}
+        read -r h _ <<<"$line" || true
+        [ -z "$h" ] || hosts+=("$h")
+    done <"$1"
+}
+
+# Each device runs in its own subshell, so these globals are its own.
+
+log()
+{
+    printf '[%s] %s\n' "$ip" "$*"
+}
+
+finish()
+{
+    printf '%s\t%s\n' "$1" "$2" >"$result_file"
+    if [ "$1" = ok ] || [ "$1" = unchanged ] || [ "$1" = pending ]
+    then
+        log "$1: $2"
+    else
+        log "$1: $2" >&2
+    fi
+    exit 0
+}
+
+# api <command>: reply of :4028, without the closing NUL.
+api()
+{
+    # shellcheck disable=SC2016
+    timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2" && printf "{\"command\":\"%s\"}" "$3" >&3 &&
+        tr -d "\0" <&3' mmpool-api "$ip" "$api_port" "$1" 2>/dev/null
+}
+
+# parse_pools <reply>: fills p_id, p_url, p_user, p_status, p_active, p_acc; fails on a reply
+# that is neither a pool list nor "No pools".
+parse_pools()
+{
+    local r=$1 e re='\{[^{}]*\}' fre
+
+    p_id=() p_url=() p_user=() p_status=() p_active=() p_acc=()
+    if [[ $r == *'"STATUS":"E"'* && $r == *'"Code":8,'* ]]
+    then
+        return 0
+    fi
+    [[ $r == *'"POOLS":['* ]] || return 1
+    r=${r#*\"POOLS\":[}
+    while [[ $r =~ $re ]]
+    do
+        e=${BASH_REMATCH[0]}
+        r=${r#*"$e"}
+        fre='"POOL":([0-9]+)'
+        [[ $e =~ $fre ]] && p_id+=("${BASH_REMATCH[1]}") || p_id+=("")
+        fre='"URL":"([^"]*)"'
+        [[ $e =~ $fre ]] && p_url+=("${BASH_REMATCH[1]}") || p_url+=("")
+        fre='"User":"([^"]*)"'
+        [[ $e =~ $fre ]] && p_user+=("${BASH_REMATCH[1]}") || p_user+=("")
+        fre='"Status":"([^"]*)"'
+        [[ $e =~ $fre ]] && p_status+=("${BASH_REMATCH[1]}") || p_status+=("")
+        fre='"Stratum Active":(true|false)'
+        [[ $e =~ $fre ]] && p_active+=("${BASH_REMATCH[1]}") || p_active+=("false")
+        fre='"Accepted":([0-9]+)'
+        [[ $e =~ $fre ]] && p_acc+=("${BASH_REMATCH[1]}") || p_acc+=(0)
+    done
+}
+
+find_target()
+{
+    local j
+
+    for j in "${!p_url[@]}"
+    do
+        if [ "${p_url[j]}" = "${t_url[$1]}" ] && [ "${p_user[j]}" = "${t_user[$1]}" ]
+        then
+            printf '%s' "$j"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# The running pools are the listed ones (and no other, unless --keep-unused).
+pools_match()
+{
+    local i
+
+    for i in "${!t_url[@]}"
+    do
+        find_target "$i" >/dev/null || return 1
+    done
+    [ -n "$keep_unused" ] || [ ${#p_url[@]} -eq ${#t_url[@]} ]
+}
+
+summary_elapsed()
+{
+    local r re='"Elapsed":([0-9]+)'
+
+    r=$(api summary) || return 1
+    [[ $r =~ $re ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# rest <path> <json body> [auth]: POST to the device; sets r_curl, r_http, r_body. The token
+# and the body go to curl on stdin only.
+rest()
+{
+    local out
+
+    r_curl=0
+    out=$({
+        if [ "${3:-}" = auth ]
+        then
+            printf 'header = "Token: %s"\n' "$token"
+        fi
+        printf 'data-binary = "%s"\n' "$(cfg_str "$2")"
+    } | curl -K - -sS -k "${pin_args[@]}" --max-time "$req_timeout" \
+        -H 'Content-Type: application/json' -w '\n%{http_code}' \
+        "https://${url_host}:${port}/api/v1/$1" 2>/dev/null) || r_curl=$?
+    r_http=${out##*$'\n'}
+    r_body=${out%$'\n'*}
+    if [[ $out != *$'\n'* ]] || ! [[ $r_http =~ ^[0-9]{3}$ ]]
+    then
+        r_http=000
+        r_body=''
+    fi
+}
+
+curl_fail()
+{
+    case $r_curl in
+    90) finish pin_mismatch "public key does not match --pin" ;;
+    35 | 60) finish tls_error "TLS handshake failed (curl $r_curl)" ;;
+    *) finish unreachable "https://${url_host}:${port} (curl $r_curl)" ;;
+    esac
+}
+
+get_token()
+{
+    local body code re='"Token":"([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"' waited=''
+
+    body=$(printf '{"command":"token","user":"%s","password":"%s"}' \
+        "$(json_str "$user")" "$(json_str "$pass")")
+    while :
+    do
+        rest token "$body"
+        if [ "$r_http" = 000 ]
+        then
+            if [ -n "$fallback_port" ] && [ "$port" != "$fallback_port" ] &&
+                { [ "$r_curl" = 7 ] || [ "$r_curl" = 28 ]; }
+            then
+                log "port $port refused, using $fallback_port"
+                port=$fallback_port
+                continue
+            fi
+            curl_fail
+        fi
+        if [ "$r_http" = 200 ] && [[ $r_body =~ $re ]] && [ ${#BASH_REMATCH[1]} -le 1023 ]
+        then
+            token=${BASH_REMATCH[1]}
+            return 0
+        fi
+        code=$(reply_code "$r_body")
+        case $r_http/$code in
+        429/* | */506)
+            if [ -n "$wait_lock" ] && [ -z "$waited" ]
+            then
+                log "login locked, waiting ${lock_wait} s"
+                sleep "$lock_wait"
+                waited=1
+                continue
+            fi
+            finish locked "login locked (HTTP 429, Code $code); retry after 60 s" ;;
+        401/601 | 400/601) finish auth_failed "wrong user or password (Code 601), not retried" ;;
+        403/603) finish webpass_unset "web password not set (Code 603)" ;;
+        503/604) finish token_unavailable "token service unavailable (Code 604)" ;;
+        *) finish token_failed "HTTP $r_http, Code $code: $(reply_msg "$r_body")" ;;
+        esac
+    done
+}
+
+# post <path> <json body>: authenticated POST, retried on network errors, 503 and 504, and
+# once with a new token on 401.
+post()
+{
+    local try=0 renewed=''
+
+    while :
+    do
+        rest "$1" "$2" auth
+        case $r_curl/$r_http in
+        90/* | 35/* | 60/*) curl_fail ;;
+        */000 | */503 | */504)
+            if [ $try -lt 2 ]
+            then
+                try=$((try + 1))
+                sleep "$try"
+                continue
+            fi ;;
+        */401)
+            if [ -z "$renewed" ]
+            then
+                renewed=1
+                get_token
+                continue
+            fi ;;
+        esac
+        return 0
+    done
+}
+
+# setpool <slot> [<i>]: write target i into slot, or clear the slot.
+setpool()
+{
+    local param what
+
+    if [ $# -eq 2 ]
+    then
+        param="$1,${t_url[$2]},${t_user[$2]},${t_pass[$2]}"
+        what="${t_url[$2]} ${t_user[$2]}"
+    else
+        param=$1
+        what=cleared
+    fi
+    post pools "{\"command\":\"setpool\",\"parameter\":\"$(json_str "$param")\"}"
+    if [ "$r_http" = 200 ] && [ "$(reply_status "$r_body")" = S ] &&
+        [ "$(reply_code "$r_body")" = 133 ]
+    then
+        log "slot $1: $what"
+        written=$((written + 1))
+        [ $# -eq 2 ] || cleared=$((cleared + 1))
+        return 0
+    fi
+    if [ "$r_http" = 000 ]
+    then
+        set_err="slot $1: no reply (curl $r_curl)"
+    else
+        set_err="slot $1: HTTP $r_http, Code $(reply_code "$r_body"): $(reply_msg "$r_body")"
+    fi
+    return 1
+}
+
+enable_pool()
+{
+    post pools "{\"command\":\"enablepool\",\"parameter\":\"${p_id[$1]}\"}"
+    if [ "$r_http" = 200 ] && [ "$(reply_status "$r_body")" = S ]
+    then
+        log "enabled pool ${p_id[$1]} (${p_url[$1]})"
+    else
+        log "enablepool ${p_id[$1]}: HTTP $r_http, Code $(reply_code "$r_body"):" \
+            "$(reply_msg "$r_body")" >&2
+    fi
+}
+
+# Warn about, or enable, the listed pools the miner runs as Disabled. Needs a token for
+# --enable-disabled.
+handle_disabled()
+{
+    local i j
+
+    for i in "${!t_url[@]}"
+    do
+        j=$(find_target "$i") || continue
+        [ "${p_status[j]}" = Disabled ] || continue
+        if [ -n "$enable_disabled" ]
+        then
+            [ -n "$token" ] || get_token
+            enable_pool "$j"
+        elif [ -z "${warned[j]:-}" ]
+        then
+            warned[j]=1
+            log "warning: pool ${p_id[j]} (${p_url[j]}) is Disabled; --enable-disabled" \
+                "enables it" >&2
+        fi
+    done
+}
+
+verify()
+{
+    local deadline=$((SECONDS + verify_timeout)) r el i j base='' state='no reply from :4028'
+    local down=''
+
+    while :
+    do
+        if r=$(api pools) && parse_pools "$r"
+        then
+            if [ -n "$elapsed0" ] && [ -z "$rebooted" ]
+            then
+                # Elapsed restarts at 0: below its value before the reboot plus the time
+                # since, the miner restarted.
+                if [ -n "$down" ] ||
+                    { el=$(summary_elapsed) &&
+                        [ "$el" -lt $((elapsed0 + SECONDS - t_reboot - 5)) ]; }
+                then
+                    rebooted=1
+                fi
+            fi
+            if [ -n "$elapsed0" ] && [ -z "$rebooted" ]
+            then
+                state='miner has not restarted yet'
+            elif ! pools_match
+            then
+                state="running pools differ: $(running_list)"
+            else
+                handle_disabled
+                state='no listed pool is Alive and Stratum Active'
+                for i in "${!t_url[@]}"
+                do
+                    j=$(find_target "$i")
+                    if [ "${p_status[j]}" = Alive ] && [ "${p_active[j]}" = true ]
+                    then
+                        if [ "${base%:*}" = "$i" ] && [ "${p_acc[j]}" -gt "${base#*:}" ]
+                        then
+                            mining="${t_url[i]}, Accepted ${p_acc[j]}"
+                            return 0
+                        fi
+                        if [ "${base%:*}" != "$i" ] || [ "${p_acc[j]}" -lt "${base#*:}" ]
+                        then
+                            base="$i:${p_acc[j]}"
+                        fi
+                        state="${t_url[i]} Alive, Accepted stays at ${p_acc[j]}"
+                        break
+                    fi
+                done
+            fi
+        else
+            down=1
+            state='no reply from :4028'
+        fi
+        if [ $SECONDS -ge $deadline ]
+        then
+            check_err="after ${verify_timeout} s: $state"
+            return 1
+        fi
+        sleep "$verify_interval"
+    done
+}
+
+running_list()
+{
+    local j s=''
+
+    for j in "${!p_url[@]}"
+    do
+        s+="${s:+, }${p_url[j]} ${p_user[j]} ${p_status[j]}"
+    done
+    printf '%s' "${s:-none}"
+}
+
+device()
+{
+    local r had_pools=1 msg i
+
+    ip=$1
+    result_file=$2
+    port=$rest_port
+    token=''
+    written=0
+    cleared=0
+    elapsed0=''
+    rebooted=''
+    t_reboot=0
+    declare -A warned=()
+    url_host=$ip
+    [[ $ip != *:* ]] || url_host="[$ip]"
+    pin_args=()
+    if [ -n "$pin" ]
+    then
+        if [[ $pin == sha256//* ]]
+        then
+            pin_args=(--pinnedpubkey "$pin")
+        else
+            r=$(awk -v h="$ip" '$1 == h { print $2; exit }' "$pin")
+            [ -n "$r" ] || finish pin_mismatch "no pin for $ip in $pin"
+            pin_args=(--pinnedpubkey "$r")
+        fi
+    fi
+
+    if r=$(api pools) && parse_pools "$r"
+    then
+        if [ ${#p_url[@]} -eq 0 ]
+        then
+            had_pools=''
+        elif pools_match && [ -z "$force" ]
+        then
+            handle_disabled
+            finish unchanged "running pools match; --force rewrites them"
+        fi
+    else
+        log "warning: no pool list from :${api_port}" >&2
+    fi
+
+    get_token
+    for i in "${!t_url[@]}"
+    do
+        setpool "$i" "$i" || break
+    done
+    if [ -z "${set_err:-}" ] && [ -z "$keep_unused" ]
+    then
+        for ((i = ${#t_url[@]}; i < 3; i++))
+        do
+            setpool "$i" || break
+        done
+    fi
+    if [ -n "${set_err:-}" ]
+    then
+        if [ "$written" -gt 0 ]
+        then
+            finish partial "$written slot(s) written, then $set_err; run again"
+        fi
+        finish setpool_failed "$set_err"
+    fi
+
+    msg="$((written - cleared)) pool(s) set, $cleared slot(s) cleared"
+    if [ -z "$had_pools" ]
+    then
+        msg+=", miner had no pool: no reboot"
+    elif [ -n "$no_reboot" ]
+    then
+        finish pending "$msg; take effect at the next reboot"
+    else
+        elapsed0=$(summary_elapsed) || elapsed0=''
+        t_reboot=$SECONDS
+        post system/reboot "{\"command\":\"reboot\",\"parameter\":\"$reboot_delay\"}"
+        if [ "$r_http" = 000 ]
+        then
+            log "no reply to the reboot request (curl $r_curl); checking whether it restarts"
+        elif [ "$r_http" != 200 ] || [ "$(reply_status "$r_body")" != S ]
+        then
+            finish reboot_failed "$msg; reboot: HTTP $r_http, Code $(reply_code "$r_body"):" \
+                "$(reply_msg "$r_body")"
+        fi
+        msg+=", rebooted"
+        log "reboot requested"
+    fi
+    if [ -n "$no_verify" ]
+    then
+        finish ok "$msg, not checked"
+    fi
+    if verify
+    then
+        finish ok "$msg, mining on $mining"
+    fi
+    finish verify_failed "$msg; check $check_err"
+}
+
+config=''
+hosts=()
+jobs=8
+keep_unused=''
+force=''
+no_reboot=''
+reboot_delay=0
+no_verify=''
+verify_timeout=300
+verify_interval=10
+enable_disabled=''
+wait_lock=''
+lock_wait=${MMPOOL_LOCK_WAIT:-61}
+pin=''
+rest_port=8443
+fallback_port=''
+api_port=4028
+req_timeout=10
+dry_run=''
+
+while [ $# -gt 0 ]
+do
+    case $1 in
+    -h | --help) usage; exit 0 ;;
+    -c | --config | --hosts | -j | --jobs | --reboot-delay | --verify-timeout | \
+        --verify-interval | --pin | --rest-port | --fallback-port | --api-port | --timeout)
+        [ $# -ge 2 ] || die_usage "$1 needs a value"
+        case $1 in
+        -c | --config) config=$2 ;;
+        --hosts) read_hosts "$2" ;;
+        -j | --jobs) jobs=$2 ;;
+        --reboot-delay) reboot_delay=$2 ;;
+        --verify-timeout) verify_timeout=$2 ;;
+        --verify-interval) verify_interval=$2 ;;
+        --pin) pin=$2 ;;
+        --rest-port) rest_port=$2 ;;
+        --fallback-port) fallback_port=$2 ;;
+        --api-port) api_port=$2 ;;
+        --timeout) req_timeout=$2 ;;
+        esac
+        shift ;;
+    --keep-unused) keep_unused=1 ;;
+    --force) force=1 ;;
+    --no-reboot) no_reboot=1 ;;
+    --no-verify) no_verify=1 ;;
+    --enable-disabled) enable_disabled=1 ;;
+    --wait-lock) wait_lock=1 ;;
+    --dry-run) dry_run=1 ;;
+    --) shift; hosts+=("$@"); break ;;
+    -*) die_usage "unknown option $1" ;;
+    *) hosts+=("$1") ;;
+    esac
+    shift
+done
+
+for v in jobs reboot_delay verify_timeout verify_interval rest_port api_port req_timeout \
+    lock_wait ${fallback_port:+fallback_port}
+do
+    is_num "${!v}" || die_usage "${v//_/-} is not a number: ${!v}"
+done
+[ "$jobs" -ge 1 ] || die_usage "--jobs must be at least 1"
+[ "$reboot_delay" -le 300 ] || die_usage "--reboot-delay must be 0..300"
+[ "$verify_interval" -ge 1 ] || die_usage "--verify-interval must be at least 1"
+[ "$req_timeout" -ge 1 ] || die_usage "--timeout must be at least 1"
+[ -n "$config" ] || die_usage "no pool file (-c)"
+[ ${#hosts[@]} -gt 0 ] || die_usage "no device"
+for h in "${hosts[@]}"
+do
+    [[ $h =~ ^[A-Za-z0-9._:-]+$ ]] || die_usage "invalid device address: $h"
+done
+if [ -n "$pin" ] && [[ $pin != sha256//* ]] && ! [ -r "$pin" ]
+then
+    die_usage "--pin is neither sha256//<base64> nor a readable file: $pin"
+fi
+
+user=${MMPOOL_USER:-${MMUPGRADE_USER:-admin}}
+pass=${MMPOOL_PASS:-${MMUPGRADE_PASS:-}}
+pool_pass_env=${MMPOOL_POOL_PASS:-}
+# Keep the passwords out of the environment of curl and the other children.
+export -n MMPOOL_PASS MMUPGRADE_PASS MMPOOL_POOL_PASS
+t_url=() t_user=() t_pass=() secrets=()
+read_config "$config"
+
+if [ -n "$dry_run" ]
+then
+    for i in "${!t_url[@]}"
+    do
+        echo "slot $i: ${t_url[i]} ${t_user[i]} ***"
+    done
+    for ((i = ${#t_url[@]}; i < 3; i++))
+    do
+        if [ -n "$keep_unused" ]
+        then
+            echo "slot $i: unchanged"
+        else
+            echo "slot $i: cleared"
+        fi
+    done
+    echo "devices: ${hosts[*]}"
+    exit 0
+fi
+
+if [ -z "$pass" ]
+then
+    if [ -t 0 ] && [ -r /dev/tty ]
+    then
+        read -rs -p "web password for $user: " pass </dev/tty
+        echo >&2
+    fi
+    [ -n "$pass" ] || die_usage "no web password: set \$MMPOOL_PASS"
+fi
+secrets+=("$pass")
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+running=0
+for i in "${!hosts[@]}"
+do
+    if [ "$running" -ge "$jobs" ]
+    then
+        wait -n || true
+        running=$((running - 1))
+    fi
+    (device "${hosts[i]}" "$tmp/$i") &
+    running=$((running + 1))
+done
+wait || true
+
+rc=0
+printf '\n%-24s %-17s %s\n' DEVICE RESULT DETAIL
+for i in "${!hosts[@]}"
+do
+    res=error
+    detail='no result'
+    if [ -s "$tmp/$i" ]
+    then
+        IFS=$'\t' read -r res detail <"$tmp/$i"
+    fi
+    printf '%-24s %-17s %s\n' "${hosts[i]}" "$res" "$detail"
+    case $res in
+    ok | unchanged | pending) ;;
+    verify_failed) [ "$rc" -eq 1 ] || rc=3 ;;
+    *) rc=1 ;;
+    esac
+done
+exit "$rc"

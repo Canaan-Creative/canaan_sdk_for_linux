@@ -1,0 +1,202 @@
+The license texts are in third-party-license/. Patches carry the license of the files they modify,
+and the Git submodules keep their own licenses. The licenses of the other packages in the firmware
+image are under /usr/share/common-licenses/.
+
+-------------------------------------------------------------------------------
+Third-party components
+-------------------------------------------------------------------------------
+
+OpenSBI 1.7
+  bootloader/opensbi (commit ec52ac7d13cb477d3adf70b46a306c817a5b5603) from
+  https://github.com/XUANTIE-RV/opensbi (branch opensbi-v1.7-dev), with the
+  meta-xuantie opensbi patch to lib/sbi/sbi_pmu.c and the patches in
+  product/k230/common/recipes-bsp/opensbi/files
+  Copyright (c) 2019 Western Digital Corporation or its affiliates and other
+  contributors.
+  License: BSD-2-Clause (bootloader/opensbi/COPYING.BSD), BSD-3-Clause and
+  GPL-2.0-only, as stated in each file
+  The firmware also compiles in:
+    - lib/utils/sys/htif.c:
+      Copyright (c) 2010-2020, The Regents of the University of California
+      (Regents).  All Rights Reserved.
+      License: BSD-3-Clause
+    - lib/utils/sys/atcsmu.c:
+      Copyright (c) 2023 Andes Technology Corporation
+      License: BSD-3-Clause
+    - platform/generic/andes/andes_pma.c:
+      Copyright (C) 2023 Renesas Electronics Corp.
+      Copyright (c) 2024 Andes Technology Corporation
+      License: GPL-2.0-only
+    - platform/generic/renesas/rzfive/rzfive.c:
+      Copyright (C) 2022 Renesas Electronics Corp.
+      License: GPL-2.0-only
+
+U-Boot 2025.07
+  bootloader/u-boot (tag v2025.07), with the patches in
+  product/k230/common/recipes-bsp/u-boot/files
+  Copyright (c) Wolfgang Denk and the U-Boot contributors
+  License: GPL-2.0-or-later, and the licenses stated in individual files
+  (bootloader/u-boot/Licenses/README)
+  The images also compile in:
+    - lib/elf.c and cmd/elf.c:
+      Copyright (c) 2001 William L. Pitts
+      License: BSD-2-Clause (bootloader/u-boot/Licenses/bsd-2-clause.txt)
+
+Linux kernel 6.6.36
+  os/linux (commit 7d4e1f444f461dbe3833bd99a4640e7b6c2cd529) from
+  https://github.com/ruyisdk/linux-xuantie-kernel, with the patches in
+  product/k230/common/recipes-kernel/linux/files
+  Copyright (c) Linus Torvalds and the Linux kernel contributors
+  (os/linux/COPYING, os/linux/CREDITS)
+  License: GPL-2.0-only WITH Linux-syscall-note, and the licenses stated in
+  individual files (os/linux/COPYING)
+
+civetweb v1.16-268-gd110e873 (commit d110e8731c6aa0fcd04504deb449bdb773cfb9da)
+  https://github.com/civetweb/civetweb, fetched at build time by the
+  meta-networking civetweb recipe with
+  product/k230/miner/common/recipes-connectivity/civetweb/civetweb_%.bbappend
+  Copyright (c) 2013-2025 The CivetWeb developers
+  Copyright (c) 2004-2013 Sergey Lyubka
+  Copyright (c) 2013 No Face Press, LLC (Thomas Davis)
+  Copyright (c) 2013 F-Secure Corporation
+  License: MIT (LICENSE.md in the civetweb tree)
+  The build also compiles in:
+    - src/md5.inl:
+      Copyright (C) 1999, 2000, 2002 Aladdin Enterprises
+      License: Zlib
+    - src/sha1.inl (Steve Reid): public domain
+  apps/miner-web/tests/stubs/civetweb.h declares part of the civetweb API
+  for the host tests, under the civetweb copyright and MIT license.
+
+OpenSSL 3.5.9
+  https://www.openssl.org, fetched at build time by
+  build/yocto/meta-canaan/recipes-connectivity/openssl/openssl_3.5.9.bb,
+  with the three patches it lists to Configure, Configurations/unix-Makefile.tmpl,
+  crypto/build.info and the test helpers; no library source file is changed
+  This component has been modified in this distribution.
+  Copyright (c) 1998-2026 The OpenSSL Project Authors
+  Copyright (c) 1995-1998 Eric A. Young, Tim J. Hudson
+  License: Apache-2.0 (LICENSE.txt in the OpenSSL tree)
+
+LVGL 9.2.2
+  https://github.com/lvgl/lvgl, tag v9.2.2
+  (commit 7f07a129e8d77f4984fff8e623fd5be18ff42e74), fetched at build time by
+  product/k230/miner/avalon-home/nano3s/recipes-graphics/lvgl/lvgl_9.2.2.bb,
+  with the patches to src/drivers/display/fb/lv_linux_fbdev.c in
+  product/k230/miner/avalon-home/nano3s/recipes-graphics/lvgl/files
+  Copyright (c) 2021 LVGL Kft
+  License: MIT
+  product/k230/miner/avalon-home/nano3s/recipes-graphics/lvgl/files/lv_conf.h
+  is derived from lv_conf_template.h in the LVGL tree.
+  The LVGL build (lv_conf.h) compiles in the following bundled components:
+    - LodePNG version 20230410 (LV_USE_LODEPNG):
+      Copyright (c) 2005-2023 Lode Vandevenne
+      License: Zlib
+    - gifdec (LV_USE_GIF): public domain
+    - TLSF memory allocator (LV_USE_STDLIB_MALLOC = LV_STDLIB_BUILTIN):
+      Copyright (c) 2006-2016, Matthew Conte
+      License: BSD-3-Clause
+    - printf (LV_USE_STDLIB_SPRINTF = LV_STDLIB_BUILTIN):
+      (c) Marco Paland (info@paland.com)
+      2014-2019, PALANDesign Hannover, Germany
+      License: MIT
+    - cubic-bezier easing in src/misc/lv_math.c (bezier-easing):
+      Copyright (c) 2014 Gaëtan Renaudeau
+      License: MIT
+    - Montserrat 12, 14, 16 and 32 fonts with Font Awesome symbols:
+      Copyright 2011 The Montserrat Project Authors (https://github.com/JulietaUla/Montserrat)
+      Copyright (c) Font Awesome
+      Font Awesome Free 5.9.0 by @fontawesome - https://fontawesome.com
+      License: OFL-1.1
+  The other components in the LVGL tree are not compiled into the firmware
+  and keep their notices unchanged in their files.
+
+js-sha256 0.11.0
+  https://github.com/emn178/js-sha256
+  apps/miner-web/third_party/js-sha256/sha256.min.js
+  Copyright (c) 2014-2024 Chen, Yi-Cyuan <emn178@gmail.com>
+  License: MIT
+
+qrcodejs (untagged master, commit 04f46c6, 2015-11-25)
+  https://github.com/davidshimjs/qrcodejs
+  apps/miner-web/third_party/qrcodejs/qrcode.min.js
+  Copyright (c) 2012 davidshimjs
+  Copyright (c) 2009 Kazuhiko Arase (QRCode for JavaScript)
+  License: MIT
+
+clock_font_40, a Modified Version of the Anton font Version 1.000
+  https://github.com/google/fonts/tree/8ccda7bf739842777d42661d1b384b926194e24b/ofl/anton
+  apps/miner/miner_mgmt/ui/clock_font_40.c
+  Modified by Canaan Creative Co., Ltd.: the glyphs U+0020-U+007E were
+  converted with lv_font_conv into 40 px, 4 bpp LVGL bitmap data and all
+  other glyphs were removed. The Modified Version is named "clock_font_40"
+  and does not use the Reserved Font Name "Anton".
+  Copyright (c) 2011, Vernon Adams (vern@newtypography.co.uk),
+  with Reserved Font Name Anton.
+  License: OFL-1.1 (the Modified Version remains under OFL-1.1)
+
+rtl8723du WiFi driver
+  https://github.com/lwfinger/rtl8723du
+  (commit ae03b0861351f72808405ddda80e8aab105bcfce), fetched at build time by
+  build/yocto/meta-canaan/recipes-connectivity/rtl8723du/rtl8723du_1.0.bb,
+  with one patch
+  Copyright(c) 2007 - 2017 Realtek Corporation
+  License: GPL-2.0-only
+
+rtl8723d Bluetooth firmware
+  rtl_bt/rtl8723d_fw.bin and rtl_bt/rtl8821c_config.bin (installed as
+  rtl_bt/rtl8723d_config.bin), fetched at build time by
+  build/yocto/meta-canaan/recipes-connectivity/rtl8723d-bt-fw/rtl8723d-bt-fw_1.0.bb from
+  https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git
+  (commit a2dcb924f0897368b0b4f305cbf9808cdda90ce0)
+  Copyright (c) 2010, Realtek Semiconductor Corporation
+  License: LicenseRef-Firmware-rtlwifi_firmware
+  (LICENSES/LICENCE.rtlwifi_firmware.txt in linux-firmware, fetched with the
+  firmware and installed as /lib/firmware/LICENCE.rtlwifi_firmware.txt)
+
+BlueZ 5.65
+  https://www.bluez.org, fetched at build time by the openembedded-core
+  bluez5 recipe, with the patch to src/gatt-database.c in
+  product/k230/miner/avalon-home/nano3s/recipes-connectivity/bluez5 and the
+  openembedded-core CVE-2023-27349 patch to profiles/audio/avrcp.c
+  Copyright (c) the BlueZ contributors (AUTHORS in the BlueZ source)
+  License: GPL-2.0-or-later and LGPL-2.1-or-later, as stated in each file
+  src/gatt-database.c:
+    Copyright (C) 2015 Google Inc.
+    License: GPL-2.0-or-later
+
+BitBake 2.2.0
+  bitbake in the openembedded-core layer fetched at build time by build.sh,
+  with the patch in build/yocto/patches to lib/bb/utils.py
+  Copyright (C) 2004 Michael Lauer
+  License: GPL-2.0-only
+
+xuantie-yocto (meta-xuantie and xuantie-build)
+  https://github.com/XUANTIE-RV/xuantie-yocto, tag XuanTie_V1.3.2-6.6
+  (commit 0ff6ba270ee1838da932d20c7e20352d15e984a0), fetched at build time
+  by build.sh
+  Copyright (c) the xuantie-yocto contributors
+  License: Apache-2.0, per LICENSE.txt on the project's master branch (added in
+  commit cba4922d963d); the tagged release carries no license file
+  This component has been modified in this distribution.
+  Files modified by Canaan Creative Co., Ltd., under Apache-2.0 as a whole:
+    - build/yocto/meta-canaan/recipes-connectivity/openssl/openssl_3.5.9.bb
+    - product/k230/common/recipes-core/images/canaan-image-minimal.bb
+    - build/yocto/xuantie-build/xuantie/conf/{bblayers.conf,local.conf}
+    - the patches in build/yocto/patches to the meta-xuantie files
+      recipes-graphics/glm/glm_0.9.9.8.bbappend,
+      recipes-graphics/vulkan/assimp_5.0.1.bbappend,
+      recipes-support/glog/glog_0.5.0.bbappend,
+      recipes-extended/procps/procps_3.3.17.bbappend,
+      conf/distro/include/xuantie-toolchain-init.sh and
+      recipes-benchmark/aibench/aibench.bb
+  Copied unchanged from it:
+    - build/yocto/xuantie-build/xuantie/conf/templateconf.cfg
+
+OpenEmbedded metadata
+  Recipes, scripts and configuration copied from or derived from
+  openembedded-core, meta-k230 and meta-virtualization, and the patch in
+  build/yocto/patches to meta-external-toolchain.
+  Copyright (c) the respective OpenEmbedded and layer contributors
+  License: MIT for metadata and GPL-2.0-only for other files, unless stated
+  otherwise in the file (LICENSE in openembedded-core)

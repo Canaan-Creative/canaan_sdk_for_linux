@@ -1,0 +1,10 @@
+[submodule "bootloader/u-boot"]
+	path = bootloader/u-boot
+	url = https://github.com/u-boot/u-boot.git
+[submodule "bootloader/opensbi"]
+	path = bootloader/opensbi
+	url = https://github.com/XUANTIE-RV/opensbi.git
+[submodule "os/linux"]
+	path = os/linux
+	url = https://github.com/ruyisdk/linux-xuantie-kernel.git
+	shallow = true

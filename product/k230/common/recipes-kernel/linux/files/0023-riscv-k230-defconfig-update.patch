@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: k230_defconfig: enable usb gadget, v4l2 and iomux
+
+Enable the USB network and configfs gadget functions (mass storage,
+RNDIS, ACM, FunctionFS), V4L2 with the mem2mem test driver, Bluetooth as
+a module and the K230 IOMUX and reset drivers, and set the local version
+to -k230.
+
+Upstream-Status: Pending
+---
+ arch/riscv/configs/k230_defconfig | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/arch/riscv/configs/k230_defconfig b/arch/riscv/configs/k230_defconfig
+index 369cd24be..9f3bee5de 100644
+--- a/arch/riscv/configs/k230_defconfig
++++ b/arch/riscv/configs/k230_defconfig
+@@ -300,3 +300,18 @@ CONFIG_SND_SOC_K230_INNO=y
+ CONFIG_SND_SOC_CANAAN_K230_INNO=y
+ CONFIG_SND_SOC_CANAAN_K230_AUDIO=y
+ CONFIG_K230_PERIDMA=y
++CONFIG_BT=m
++CONFIG_USB_USBNET=y
++CONFIG_USB_CONFIGFS=m
++CONFIG_USB_CONFIGFS_F_FS=y
++CONFIG_USB_CONFIGFS_MASS_STORAGE=y
++CONFIG_USB_CONFIGFS_RNDIS=y
++CONFIG_USB_CONFIGFS_ACM=y
++CONFIG_VIDEO_DEV=y
++CONFIG_VIDEOBUF2_DMA_CONTIG=y
++CONFIG_V4L_TEST_DRIVERS=y
++CONFIG_VIDEO_VIM2M=m
++CONFIG_PINCTRL_K230_IOMUX=y
++CONFIG_RESET_K230=y
++CONFIG_LOCALVERSION="-k230"
++# CONFIG_LOCALVERSION_AUTO is not set
+-- 
+2.43.0
+

@@ -1,0 +1,1155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] crypto: kendryte-hash: rework the sha256 data path
+
+The driver never ran correctly, and nothing called it:
+
+ - dma_write_rwcfg() freed the coherent input buffer before the DMA
+   started, so the engine read freed memory.
+ - init() ioremapped the PUF DMA and crypto blocks into file-scope
+   pointers and final() unmapped them, with no lock, so two requests in
+   flight used each other's mappings, and the AES driver programs the
+   same PUF DMA channel.
+ - final() returned 0 when the engine failed, export() and import() did
+   nothing, the busy wait had no timeout, and the kzalloc() result was
+   not checked.
+
+Rewrite the data path:
+
+ - One 16 KiB coherent bounce buffer, allocated at probe. Each DMA block
+   is copied in; it is reused only after the engine is idle. A streaming
+   buffer synced for the device does not work here: about one block in
+   40000, typically a short continuation block written over the previous
+   one, is hashed from stale bytes, with no DMA or hash status error,
+   and the same block run again comes out right.
+ - Every programming sequence holds the kendryte-puf lock. Register
+   blocks are mapped once at probe.
+ - The request context holds the engine state, the length counters and
+   the unsent tail, so export() and import() copy it whole.
+ - Errors and a 100 ms DMA timeout are returned to the caller.
+ - finup() and digest() send a message that fits the bounce buffer as a
+   single head-and-tail block. The empty message returns the known
+   digest without the engine.
+
+The register sequence is unchanged. The engine is driven under a mutex,
+so the priority drops from 300 to 50, below sha256-generic: kernel users
+and AF_ALG "sha256" keep the generic code, and a caller selects the
+engine by its driver name, "sha256-kendryte".
+
+Upstream-Status: Pending
+---
+ drivers/crypto/canaan/Kconfig         |   3 +-
+ drivers/crypto/canaan/kendryte-hash.c | 782 +++++++++-----------------
+ drivers/crypto/canaan/kendryte-hash.h | 205 ++-----
+ 3 files changed, 306 insertions(+), 684 deletions(-)
+
+diff --git a/drivers/crypto/canaan/Kconfig b/drivers/crypto/canaan/Kconfig
+index d49d63133..d715b9689 100644
+--- a/drivers/crypto/canaan/Kconfig
++++ b/drivers/crypto/canaan/Kconfig
+@@ -17,12 +17,13 @@ config CRYPTO_DEV_KENDRYTE_HASH
+     tristate "Support for K230 sha256 accelerators"
+     select CRYPTO_HASH
+     select CRYPTO_SHA256
++    select CRYPTO_DEV_KENDRYTE_PUF
+     default ARCH_CANAAN
+     help
+         This driver interfaces with the hardware
+         hash accelerator for K230.
+         Supporting sha256 hashing
+-        algo.
++        algo, registered as "sha256-kendryte".
+ 
+ config CRYPTO_DEV_KENDRYTE_PUF
+     tristate
+diff --git a/drivers/crypto/canaan/kendryte-hash.c b/drivers/crypto/canaan/kendryte-hash.c
+index 64b3ad748..cfb9cf655 100644
+--- a/drivers/crypto/canaan/kendryte-hash.c
++++ b/drivers/crypto/canaan/kendryte-hash.c
+@@ -6,590 +6,346 @@
+  * published by the Free Software Foundation.
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+-#include <linux/of_device.h>
+-#include <linux/crypto.h>
+ #include <linux/io.h>
++#include <linux/iopoll.h>
+ #include <linux/dma-mapping.h>
+-#include <linux/mm.h>
+-#include <crypto/algapi.h>
+-#include <crypto/scatterwalk.h>
++#include <linux/scatterlist.h>
++#include <asm/unaligned.h>
+ #include <crypto/internal/hash.h>
++#include <crypto/scatterwalk.h>
+ #include <crypto/sha2.h>
+ 
+ #include "kendryte-hash.h"
++#include "kendryte-puf.h"
++
++/* Bounce buffer the DMA reads from; a multiple of SHA256_BLOCK_SIZE */
++#define KENDRYTE_HASH_BOUNCE_SIZE	(16 * 1024)
++#define KENDRYTE_HASH_TIMEOUT_US	100000
++
++struct kendryte_hash_dev {
++	struct device *dev;
++	void __iomem *hash_base;
++	void __iomem *dma_base;
++	void __iomem *crypto_base;
++	u8 *bounce;
++	dma_addr_t bounce_dma;
++};
+ 
+-/*****************************************************************************
+- * Macros
+- ****************************************************************************/
+-/**
+- * @brief Convert number of bits to number of bytes
+- *
+- * @param[in] bits Number of bits.
+- * @return Number of bytes.
+- */
+-#define b2B(bits) (((bits) + 7) / 8)
+-/**
+- * @brief Convert number of bytes to number of bits
+- *
+- * @param[in] len Number of bytes.
+- * @return Number of bits.
+- */
+-#define B2b(len) (8 * (len))
+-
+-static void *puf_dma_base;
+-static void *puf_crypto_base;
+-void *hash_dma_virt_in;
+-dma_addr_t hash_dma_phys_in;
+-struct kendryte_sha256_info sha256_info;
+-
+-//----------------------BASE FUNCTION ----------------------------------------//
+-static uint32_t be2le(uint32_t var)
+-{
+-	return (((0xff000000 & var) >> 24) | ((0x00ff0000 & var) >> 8) |
+-		((0x0000ff00 & var) << 8) | ((0x000000ff & var) << 24));
+-}
+-
+-static void write_data(uint32_t *dst, uint8_t *src, size_t length, bool le)
+-{
+-	uint32_t *src32 = (uint32_t *)src;
+-
+-	length = length / 4;
+-	size_t i;
+-
+-	for (i = 0; i < length; ++i) {
+-		if (le)
+-			*(dst + i) = be2le(*(src32 + i));
+-		else
+-			*(dst + i) = *(src32 + i);
+-	}
+-}
+-
+-static void read_data(uint8_t *dst, uint32_t *src, size_t length, bool le)
+-{
+-	uint32_t *dst32 = (uint32_t *)dst;
+-	uint32_t word_nums = 0, rest = 0, last_word;
+-
+-	word_nums = length / 4;
+-	rest = length % 4;
+-	uint32_t i;
+-
+-	for (i = 0; i < word_nums; i++) {
+-		if (le)
+-			dst32[i] = be2le(src[i]);
+-		else
+-			dst32[i] = src[i];
+-	}
+-
+-	if (rest != 0) {
+-		if (le)
+-			last_word = be2le(src[word_nums]);
+-		else
+-			last_word = src[word_nums];
++/* Per-request state; exported and imported whole */
++struct kendryte_sha256_reqctx {
++	u8 state[DGST_INT_STATE_LEN];	/* engine state after the last block */
++	u8 buf[SHA256_BLOCK_SIZE];	/* bytes not yet sent to the engine */
++	u64 count;			/* bytes sent to the engine */
++	u32 alen;			/* HASH_ALEN after the last block */
++	u32 buflen;
++	bool started;
++};
+ 
+-		memcpy(dst + (word_nums * 4), &last_word, rest);
+-	}
+-}
++static struct kendryte_hash_dev *kendryte_hash;
+ 
+-static struct blsegs segment(uint8_t *buf, uint32_t buflen, const uint8_t *in,
+-				 uint32_t inlen, uint32_t blocksize,
+-				 uint32_t minlen)
++/*
++ * Run one DMA block of len bytes from the bounce buffer through the engine.
++ * Every block but the last is a multiple of SHA256_BLOCK_SIZE; the last one
++ * may be any length and leaves the digest in @out. Caller holds the PUF lock.
++ */
++static int kendryte_sha256_block(struct kendryte_hash_dev *hd,
++				 struct kendryte_sha256_reqctx *rctx,
++				 u32 len, u8 *out)
+ {
+-	struct blsegs ret = { .nsegs = 0 };
+-	// calculate total number of blocks to be processed
+-	uint32_t nprocblocks = 0;
+-
+-	if ((buflen + inlen) >= (minlen + blocksize))
+-		nprocblocks = (buflen + inlen - minlen) / blocksize;
+-
+-	// no available block for processing, keep input in the internal buffer.
+-	if (nprocblocks == 0) {
+-		ret.seg[ret.nsegs++] = (struct segstr){ false, buf, buflen };
+-		ret.seg[ret.nsegs++] = (struct segstr){ false, in, inlen };
++	u32 flags = DMA_DSC_CFG_4_DN_INTRPT | DMA_DSC_CFG_4_DN_PAUSE;
++	u32 stat;
++	int ret, i;
++
++	if (rctx->count + len > U32_MAX)
++		return -EOVERFLOW;
++	if (readl(hd->dma_base + DMA_STAT_0_OFFSET) & DMA_STAT_0_BUSY)
++		return -EBUSY;
++
++	if (!rctx->started)
++		flags |= DMA_DSC_CFG_4_HEAD;
++	if (out)
++		flags |= DMA_DSC_CFG_4_TAIL;
++
++	writel(0, hd->dma_base + DMA_CFG_0_OFFSET);
++	writel(flags, hd->dma_base + DMA_DSC_CFG_4_OFFSET);
++	writel(len, hd->dma_base + DMA_DSC_CFG_2_OFFSET);
++	writel(0, hd->dma_base + DMA_DSC_CFG_1_OFFSET);
++	writel(lower_32_bits(hd->bounce_dma),
++	       hd->dma_base + DMA_DSC_CFG_0_OFFSET);
++	writel(FIELD_PREP(DMA_KEY_CFG_0_DST, DMA_KEY_DST_HMAC),
++	       hd->dma_base + DMA_KEY_CFG_0_OFFSET);
++
++	if (rctx->started)
++		for (i = 0; i < DGST_INT_STATE_LEN; i += 4)
++			writel(get_unaligned_be32(rctx->state + i),
++			       hd->crypto_base + CRYPTO_DGST_IN_OFFSET + i);
++
++	writel(HASH_CONFIG_SHA256, hd->hash_base + HASH_CONFIG_OFFSET);
++	writel(rctx->alen, hd->hash_base + HASH_PLEN_OFFSET);
++	writel(1, hd->dma_base + DMA_START_OFFSET);
++
++	ret = readl_poll_timeout_atomic(hd->dma_base + DMA_STAT_0_OFFSET, stat,
++					!(stat & DMA_STAT_0_BUSY), 0,
++					KENDRYTE_HASH_TIMEOUT_US);
++	if (ret) {
++		dev_err(hd->dev, "DMA timeout, status 0x%08x\n", stat);
+ 		return ret;
+ 	}
+-
+-	const uint8_t *start = in;
+-	// some blocks are ready for processing, using bytes in the internal buffer first
+-	if (buflen != 0) {
+-		// if all data in the internal buffer will be processed
+-		if (nprocblocks * blocksize >= buflen) {
+-			// fill buffer if not a complete block
+-			uint32_t proclen = blocksize;
+-
+-			nprocblocks--;
+-			while (proclen < buflen) {
+-				proclen += blocksize;
+-				nprocblocks--;
+-			}
+-			memcpy(buf + buflen, start, proclen - buflen);
+-			ret.seg[ret.nsegs++] =
+-				(struct segstr){ true, buf, proclen };
+-			start += (proclen - buflen);
+-			inlen -= (proclen - buflen);
+-		} else {
+-			// some data will be remained in the internal buffer
+-			ret.seg[ret.nsegs++] =
+-				(struct segstr){ true, buf,
+-						 nprocblocks * blocksize };
+-			ret.seg[ret.nsegs++] = (struct segstr){
+-				false, buf + nprocblocks * blocksize,
+-				buflen - nprocblocks * blocksize
+-			};
+-			nprocblocks = 0;
+-		}
++	if (stat) {
++		dev_err(hd->dev, "DMA status 0x%08x\n", stat);
++		return -EIO;
+ 	}
+-	// deal with input data
+-	if (nprocblocks > 0) {
+-		ret.seg[ret.nsegs++] =
+-			(struct segstr){ true, start, nprocblocks * blocksize };
++	stat = readl(hd->hash_base + HASH_STATUS_OFFSET);
++	if (stat) {
++		dev_err(hd->dev, "hash status 0x%08x\n", stat);
++		return -EIO;
+ 	}
+-	ret.seg[ret.nsegs++] =
+-		(struct segstr){ false, start + nprocblocks * blocksize,
+-				 inlen - nprocblocks * blocksize };
+ 
+-	return ret;
+-}
+-
+-static int get_key_slot_idx(enum kendryte_key_type_t keytype)
+-{
+-	switch (keytype) {
+-	case SWKEY:
++	if (out) {
++		for (i = 0; i < SHA256_DIGEST_SIZE; i += 4)
++			put_unaligned_be32(readl(hd->crypto_base +
++						 CRYPTO_DGST_OUT_OFFSET + i),
++					   out + i);
+ 		return 0;
+-	default:
+-		return -1;
+ 	}
+-}
+-
+-//---------------------------------CRYTPO FUNCTION----------------------------------------//
+-static enum kendryte_status_t crypto_write_dgst(uint8_t *dgst, size_t length)
+-{
+-	if (length > DGST_INT_STATE_LEN)
+-		return E_INVALID;
+-
+-	write_data((uint32_t *)(puf_crypto_base + CRYPTO_DGST_IN_OFFSET), dgst,
+-		   length, true);
+-
+-	return SUCCESS;
+-}
+-
+-static void crypto_read_dgest(uint8_t *out, size_t length)
+-{
+-	length = length < DGST_INT_STATE_LEN ? length : DGST_INT_STATE_LEN;
+-	read_data(out, (void *)(puf_crypto_base + CRYPTO_DGST_OUT_OFFSET),
+-		  length, true);
+-}
+-
+-//----------------------------------------DMA FUNCTION----------------------------------------//
+-static void dma_write_start(void)
+-{
+-	writel(0x1, puf_dma_base + DMA_START_OFFSET);
+-}
+-
+-static bool dma_check_busy_status(uint32_t *status)
+-{
+-	uint32_t stat = readl(puf_dma_base + DMA_STAT_0_OFFSET);
+-	bool busy = (stat & DMA_STATUS_0_BUSY_MASK) != 0;
+-
+-	if (status != NULL)
+-		*status = stat;
+-
+-	return busy;
+-}
+ 
+-static void dma_write_config_0(bool rng_enable, bool sgdma_enable, bool no_cypt)
+-{
+-	uint32_t value = 0;
+-
+-	if (rng_enable)
+-		value |= 0x1;
+-	if (sgdma_enable)
+-		value |= 0x1 << 1;
+-	if (no_cypt)
+-		value |= 0x1 << 2;
+-
+-	writel(value, puf_dma_base + DMA_CFG_0_OFFSET);
+-}
+-
+-static void dma_write_data_block_config(bool head, bool tail, bool dn_intrpt,
+-					bool dn_pause, uint32_t offset)
+-{
+-	uint32_t value = 0;
+-
+-	if (head)
+-		value |= 0x1 << DMA_DSC_CFG_4_HEAD_BITS;
+-	if (tail)
+-		value |= 0x1 << DMA_DSC_CFG_4_TAIL_BITS;
+-	if (dn_intrpt)
+-		value |= 0x1 << DMA_DSC_CFG_4_DN_INTRPT_BITS;
+-	if (dn_pause)
+-		value |= 0x1 << DMA_DSC_CFG_4_DN_PAUSE_BITS;
+-	value |= offset << DMA_DSC_CFG_4_OFFSET_BITS;
+-
+-	writel(value, puf_dma_base + DMA_DSC_CFG_4_OFFSET);
+-}
+-
+-static void dma_write_rwcfg(struct kendryte_sha256_ctx *ctx, const uint8_t *out,
+-				const uint8_t *in, uint32_t len)
+-{
+-	hash_dma_virt_in = dma_alloc_coherent(ctx->dev->dev, (len + 32),
+-						  &hash_dma_phys_in, GFP_KERNEL);
+-
+-	writel(len, puf_dma_base + DMA_DSC_CFG_2_OFFSET);
+-	writel((uintptr_t)out, puf_dma_base + DMA_DSC_CFG_1_OFFSET);
+-
+-	if (in == NULL) {
+-		writel((uintptr_t)in, puf_dma_base + DMA_DSC_CFG_0_OFFSET);
+-	} else {
+-		memcpy(hash_dma_virt_in, in, len);
+-		writel(hash_dma_phys_in, puf_dma_base + DMA_DSC_CFG_0_OFFSET);
+-	}
+-	dma_free_coherent(ctx->dev->dev, (len + 32), hash_dma_virt_in,
+-			  hash_dma_phys_in);
+-}
+-
+-static void dma_write_key_config_0(enum kendryte_key_type_t keytype,
+-				   enum kendryte_algo_type_t algo,
+-				   uint32_t size, uint32_t slot_index)
+-{
+-	uint32_t value = 0;
+-
+-	value |= slot_index << DMA_KEY_CFG_0_KEY_IDX_BITS;
+-	value |= size << DMA_KEY_CFG_0_KEY_SIZE_BITS;
+-	value |= algo << DMA_KEY_CFG_0_KEY_DST_BITS;
+-	value |= keytype;
+-
+-	writel(value, puf_dma_base + DMA_KEY_CFG_0_OFFSET);
+-}
+-
+-static enum kendryte_status_t _ctx_final(struct kendryte_sha256_ctx *hash_ctx,
+-					 struct kendryte_dgst_st *md)
+-{
+-	if (md == NULL)
+-		return E_INVALID;
+-
+-	crypto_read_dgest(md->dgst, DGST_INT_STATE_LEN);
+-	md->dlen = 32;
+-
+-	return SUCCESS;
++	for (i = 0; i < DGST_INT_STATE_LEN; i += 4)
++		put_unaligned_be32(readl(hd->crypto_base +
++					 CRYPTO_DGST_OUT_OFFSET + i),
++				   rctx->state + i);
++	rctx->alen = readl(hd->hash_base + HASH_ALEN_OFFSET);
++	rctx->count += len;
++	rctx->started = true;
++	return 0;
+ }
+ 
+-static enum kendryte_status_t _ctx_update(struct kendryte_sha256_ctx *hash_ctx,
+-					  struct kendryte_dgst_st *md,
+-					  const uint8_t *msg, uint32_t msglen,
+-					  bool last)
++/*
++ * Feed the buffered bytes and @len bytes of @req->src into the engine.
++ * The final @keep bytes stay buffered for the tail block, so the tail is
++ * never empty once the engine has started. Caller holds the PUF lock.
++ */
++static int kendryte_sha256_feed(struct kendryte_hash_dev *hd,
++				struct ahash_request *req, unsigned int len,
++				unsigned int keep)
+ {
+-	uint32_t val32;
+-
+-	if (last && (md == NULL))
+-		return E_INVALID;
+-
+-	if (dma_check_busy_status(NULL))
+-		return E_BUSY;
+-
+-	dma_write_config_0(false, false, false);
+-	dma_write_data_block_config(hash_ctx->start ? false : true, last, true,
+-					true, 0);
+-	dma_write_rwcfg(hash_ctx, NULL, msg, msglen);
+-	dma_write_key_config_0(hash_ctx->keytype, ALGO_TYPE_HMAC,
+-				   (hash_ctx->keybits < 512) ? hash_ctx->keybits :
+-							   512,
+-				   get_key_slot_idx(hash_ctx->keytype));
+-
+-	if (hash_ctx->start)
+-		crypto_write_dgst(hash_ctx->state, DGST_INT_STATE_LEN);
+-
+-	val32 = ((hash_ctx->hash == SHA_256) ? 0x03 : 0x08);
+-	writel(val32, hash_ctx->dev->base + HASH_CONFIG_OFFSET);
+-	writel(hash_ctx->curlen, hash_ctx->dev->base + HASH_PLEN_OFFSET);
+-
+-	flush_cache_all();
+-	dma_write_start();
+-	while (dma_check_busy_status(&val32))
+-		;
+-	if (val32 != 0) {
+-		pr_err("DMA status 0: 0x%08x\n", val32);
+-		return E_ERROR;
++	struct kendryte_sha256_reqctx *rctx = ahash_request_ctx(req);
++	int nents = sg_nents_for_len(req->src, len);
++	unsigned int remaining = rctx->buflen + len - keep;
++	unsigned int skip = 0;
++	int ret;
++
++	if (nents < 0)
++		return nents;
++
++	while (remaining) {
++		unsigned int chunk = min_t(unsigned int, remaining,
++					   KENDRYTE_HASH_BOUNCE_SIZE);
++		unsigned int pos = rctx->buflen;
++
++		memcpy(hd->bounce, rctx->buf, pos);
++		rctx->buflen = 0;
++		sg_pcopy_to_buffer(req->src, nents, hd->bounce + pos,
++				   chunk - pos, skip);
++		skip += chunk - pos;
++
++		ret = kendryte_sha256_block(hd, rctx, chunk, NULL);
++		if (ret)
++			return ret;
++		remaining -= chunk;
+ 	}
+ 
+-	val32 = readl(hash_ctx->dev->base + HASH_STATUS_OFFSET);
+-	if (val32 != 0) {
+-		pr_err("[ERROR] HMAC status: 0x%08x\n", val32);
+-		return E_ERROR;
+-	}
+-
+-	if (!last) {
+-		crypto_read_dgest(hash_ctx->state, DGST_INT_STATE_LEN);
+-		hash_ctx->curlen =
+-			readl(hash_ctx->dev->base + HASH_ALEN_OFFSET);
+-	}
+-
+-	return SUCCESS;
++	sg_pcopy_to_buffer(req->src, nents, rctx->buf + rctx->buflen,
++			   keep - rctx->buflen, skip);
++	rctx->buflen = keep;
++	return 0;
+ }
+ 
+-static enum kendryte_status_t
+-_sha256_final(struct kendryte_sha256_ctx *hash_ctx, struct kendryte_dgst_st *md)
++static int kendryte_sha256_init(struct ahash_request *req)
+ {
+-	enum kendryte_status_t check = SUCCESS;
+-
+-	check = _ctx_update(hash_ctx, md, hash_ctx->buff, hash_ctx->buflen,
+-				true);
+-	if (check != SUCCESS)
+-		goto done;
+-
+-	check = _ctx_final(hash_ctx, md);
++	struct kendryte_sha256_reqctx *rctx = ahash_request_ctx(req);
+ 
+-done:
+-	hash_ctx->op = HMAC_AVAILABLE;
+-	return check;
++	memset(rctx, 0, sizeof(*rctx));
++	return 0;
+ }
+ 
+-static enum kendryte_status_t
+-_sha256_update(struct kendryte_sha256_ctx *hash_ctx, const uint8_t *msg,
+-		   uint32_t msglen)
++static int kendryte_sha256_update(struct ahash_request *req)
+ {
+-	enum kendryte_status_t check;
+-	uint32_t i;
+-	// continue if msg is NULL or msglen is zero
+-	if ((msg == NULL) || (msglen == 0))
+-		return SUCCESS;
+-
+-	struct blsegs segs = segment(hash_ctx->buff, hash_ctx->buflen, msg,
+-					 msglen, hash_ctx->blocklen,
+-					 hash_ctx->minlen);
+-	hash_ctx->buflen = 0;
+-
+-	for (i = 0; i < segs.nsegs; i++) {
+-		if (segs.seg[i].process) {
+-			// process
+-			check = _ctx_update(
+-					 hash_ctx, NULL, segs.seg[i].addr,
+-					 segs.seg[i].len, false);
+-			if (check != SUCCESS) {
+-				// release hmac context
+-				hash_ctx->op = HMAC_AVAILABLE;
+-				return check;
+-			}
+-			if (hash_ctx->start == false)
+-				hash_ctx->start = true;
+-		} else {
+-			// keep in the internal buffer
+-			if ((segs.seg[i].addr == hash_ctx->buff) &&
+-				(hash_ctx->buflen ==
+-				 0)) { // skip copy what already in the right place
+-				hash_ctx->buflen += segs.seg[i].len;
+-			} else {
+-				// copy into the buffer
+-				memmove(hash_ctx->buff + hash_ctx->buflen,
+-					segs.seg[i].addr, segs.seg[i].len);
+-				hash_ctx->buflen += segs.seg[i].len;
+-			}
+-		}
++	struct kendryte_sha256_reqctx *rctx = ahash_request_ctx(req);
++	struct kendryte_hash_dev *hd = kendryte_hash;
++	unsigned int total = rctx->buflen + req->nbytes;
++	int ret;
++
++	if (total <= SHA256_BLOCK_SIZE) {
++		scatterwalk_map_and_copy(rctx->buf + rctx->buflen, req->src, 0,
++					 req->nbytes, 0);
++		rctx->buflen = total;
++		return 0;
+ 	}
+ 
+-	return SUCCESS;
+-}
+-
+-static enum kendryte_status_t _sha256_init(struct kendryte_sha256_ctx *hash_ctx)
+-{
+-	size_t keyaddr;
+-	uint32_t keybits;
+-
+-	hash_ctx->blocklen = 64;
+-	// initialize for hash
+-	hash_ctx->buflen = 0;
+-	hash_ctx->keybits = 0;
+-	hash_ctx->minlen = 1;
+-	hash_ctx->keytype = 0;
+-	hash_ctx->curlen = 0;
+-	hash_ctx->op = HMAC_HASH;
+-	hash_ctx->hash = SHA_256;
+-	hash_ctx->start = false;
+-
+-	keyaddr = 0;
+-	keybits = 0;
+-	memset(hash_ctx->key, 0, HMAC_BLOCK_MAXLEN);
+-	memcpy(hash_ctx->key, (const void *)keyaddr, b2B(keybits));
+-
+-	return SUCCESS;
+-}
+-
+-void sha256_free(struct kendryte_sha256_ctx *ctx, uint32_t msglen)
+-{
+-	iounmap(puf_dma_base);
+-	iounmap(puf_crypto_base);
++	kendryte_puf_lock();
++	ret = kendryte_sha256_feed(hd, req, req->nbytes,
++				   (total - 1) % SHA256_BLOCK_SIZE + 1);
++	kendryte_puf_unlock();
++	return ret;
+ }
+ 
+ static int kendryte_sha256_final(struct ahash_request *req)
+ {
+-	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+-	struct kendryte_sha256_ctx *ctx = crypto_ahash_ctx(tfm);
+-	struct kendryte_dgst_st md;
+-	enum kendryte_status_t check;
+-	int ret = 0;
+-
+-	check = _sha256_final(ctx, &md);
+-	if (check != SUCCESS)
+-		goto done;
+-
+-	memcpy(req->result, md.dgst, md.dlen);
+-
+-done:
+-	if (check != SUCCESS) {
+-		pr_err("Hash-%s Error!\n", __func__);
+-		ret = -1;
+-	}
+-
+-	sha256_free(ctx, req->nbytes);
++	struct kendryte_sha256_reqctx *rctx = ahash_request_ctx(req);
++	struct kendryte_hash_dev *hd = kendryte_hash;
++	int ret;
+ 
+-	return 0;
+-}
+-
+-static int kendryte_sha256_update(struct ahash_request *req)
+-{
+-	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+-	struct kendryte_sha256_ctx *ctx = crypto_ahash_ctx(tfm);
+-	uint8_t *msg;
+-	uint32_t msglen;
+-	enum kendryte_status_t check;
+-	int ret = 0;
+-
+-	msglen = req->nbytes;
+-	msg = kzalloc(msglen, GFP_KERNEL);
+-	scatterwalk_map_and_copy(msg, req->src, 0, msglen, 0);
+-
+-	check = _sha256_update(ctx, msg, msglen);
+-	if (check != SUCCESS)
+-		goto done;
+-
+-done:
+-	if (check != SUCCESS) {
+-		pr_err("Hash-%s Error!\n", __func__);
+-		ret = -1;
++	if (!rctx->started && !rctx->buflen) {
++		memcpy(req->result, sha256_zero_message_hash,
++		       SHA256_DIGEST_SIZE);
++		return 0;
+ 	}
+ 
+-	kfree(msg);
++	kendryte_puf_lock();
++	memcpy(hd->bounce, rctx->buf, rctx->buflen);
++	ret = kendryte_sha256_block(hd, rctx, rctx->buflen, req->result);
++	kendryte_puf_unlock();
+ 	return ret;
+ }
+ 
+-static int kendryte_sha256_init(struct ahash_request *req)
++/* A message that fits the bounce buffer goes to the engine as one block */
++static int kendryte_sha256_finup(struct ahash_request *req)
+ {
+-	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
+-	struct kendryte_sha256_ctx *ctx = crypto_ahash_ctx(tfm);
+-	enum kendryte_status_t check;
+-	int ret = 0;
+-
+-	// ioremap
+-	puf_dma_base = ioremap(0x91210000, 0x100);
+-	puf_crypto_base = ioremap(0x91210100, 0x100);
+-
+-	// hash-256
+-	ctx->op = HMAC_AVAILABLE;
+-	check = _sha256_init(ctx);
+-	if (check != SUCCESS)
+-		goto done;
+-
+-done:
+-	if (check != SUCCESS) {
+-		pr_err("Hash-%s Error!\n", __func__);
+-		ret = -1;
++	struct kendryte_sha256_reqctx *rctx = ahash_request_ctx(req);
++	struct kendryte_hash_dev *hd = kendryte_hash;
++	unsigned int total = rctx->buflen + req->nbytes;
++	int ret;
++
++	if (!total && !rctx->started)
++		return kendryte_sha256_final(req);
++
++	kendryte_puf_lock();
++	if (total > KENDRYTE_HASH_BOUNCE_SIZE) {
++		ret = kendryte_sha256_feed(hd, req, req->nbytes,
++					   (total - 1) % SHA256_BLOCK_SIZE + 1);
++		total = rctx->buflen;
++		memcpy(hd->bounce, rctx->buf, total);
++	} else {
++		memcpy(hd->bounce, rctx->buf, rctx->buflen);
++		scatterwalk_map_and_copy(hd->bounce + rctx->buflen, req->src,
++					 0, req->nbytes, 0);
++		ret = 0;
+ 	}
+-
++	if (!ret)
++		ret = kendryte_sha256_block(hd, rctx, total, req->result);
++	kendryte_puf_unlock();
+ 	return ret;
+ }
+ 
+ static int kendryte_sha256_digest(struct ahash_request *req)
+ {
+-	int ret = 0;
+-
+-	ret = kendryte_sha256_init(req);
+-	ret += kendryte_sha256_update(req);
+-	ret += kendryte_sha256_final(req);
+-	if (ret) {
+-		pr_err("Hash-%s Error!\n", __func__);
+-		return ret;
+-	}
+-
+-	return 0;
++	kendryte_sha256_init(req);
++	return kendryte_sha256_finup(req);
+ }
+ 
+-static int kendryte_sha256_import(struct ahash_request *req, const void *in)
++static int kendryte_sha256_export(struct ahash_request *req, void *out)
+ {
++	memcpy(out, ahash_request_ctx(req),
++	       sizeof(struct kendryte_sha256_reqctx));
+ 	return 0;
+ }
+ 
+-static int kendryte_sha256_export(struct ahash_request *req, void *out)
++static int kendryte_sha256_import(struct ahash_request *req, const void *in)
+ {
++	memcpy(ahash_request_ctx(req), in,
++	       sizeof(struct kendryte_sha256_reqctx));
+ 	return 0;
+ }
+ 
+-static int kendryte_sha256_cra_init(struct crypto_tfm *tfm)
++static int kendryte_sha256_init_tfm(struct crypto_ahash *tfm)
+ {
+-	struct kendryte_sha256_ctx *ctx = crypto_tfm_ctx(tfm);
+-
+-	ctx->dev = &sha256_info;
++	crypto_ahash_set_reqsize(tfm, sizeof(struct kendryte_sha256_reqctx));
+ 	return 0;
+ }
+ 
+-static struct ahash_alg
+-	kendryte_sha256_alg = { .init = kendryte_sha256_init,
+-				.update = kendryte_sha256_update,
+-				.final = kendryte_sha256_final,
+-				.digest = kendryte_sha256_digest,
+-				.export = kendryte_sha256_export,
+-				.import = kendryte_sha256_import,
+-				.halg.digestsize = SHA256_DIGEST_SIZE,
+-				.halg.statesize =
+-					sizeof(struct kendryte_sha256_ctx),
+-				.halg.base = {
+-					.cra_name = "sha256",
+-					.cra_driver_name = "sha256-kendryte",
+-					.cra_priority = 300,
+-					.cra_flags = (CRYPTO_ALG_TYPE_AHASH |
+-							  CRYPTO_ALG_ASYNC),
+-					.cra_blocksize = SHA256_BLOCK_SIZE,
+-					.cra_ctxsize = sizeof(
+-						struct kendryte_sha256_ctx),
+-					.cra_init = kendryte_sha256_cra_init,
+-					.cra_module = THIS_MODULE,
+-				} };
+-
+-static int kendryte_sha256_probe(struct platform_device *pdev)
++/*
++ * The engine is driven under a mutex and must not be entered from atomic
++ * context, so the priority stays below sha256-generic: kernel users keep
++ * the generic code and callers ask for "sha256-kendryte" by name.
++ */
++static struct ahash_alg kendryte_sha256_alg = {
++	.init = kendryte_sha256_init,
++	.update = kendryte_sha256_update,
++	.final = kendryte_sha256_final,
++	.finup = kendryte_sha256_finup,
++	.digest = kendryte_sha256_digest,
++	.export = kendryte_sha256_export,
++	.import = kendryte_sha256_import,
++	.init_tfm = kendryte_sha256_init_tfm,
++	.halg = {
++		.digestsize = SHA256_DIGEST_SIZE,
++		.statesize = sizeof(struct kendryte_sha256_reqctx),
++		.base = {
++			.cra_name = "sha256",
++			.cra_driver_name = "sha256-kendryte",
++			.cra_priority = 50,
++			.cra_flags = CRYPTO_ALG_ASYNC |
++				     CRYPTO_ALG_KERN_DRIVER_ONLY,
++			.cra_blocksize = SHA256_BLOCK_SIZE,
++			.cra_module = THIS_MODULE,
++		},
++	},
++};
++
++static int kendryte_hash_probe(struct platform_device *pdev)
+ {
+-	struct resource *res;
+ 	struct device *dev = &pdev->dev;
+-	int err = -1;
+-
+-	pr_info("Kendryte sha256 driver probe!\n");
+-
+-	sha256_info.dev = dev;
+-
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	sha256_info.base = devm_ioremap_resource(dev, res);
+-	if (IS_ERR(sha256_info.base))
+-		return PTR_ERR(sha256_info.base);
+-
+-	platform_set_drvdata(pdev, &sha256_info);
+-
+-	err = crypto_register_ahash(&kendryte_sha256_alg);
+-	if (err < 0)
+-		goto hash_err;
+-out:
+-	return err;
+-
+-hash_err:
+-	dev_err(&pdev->dev, "Unable to register hash algorithm.\n");
+-	crypto_unregister_ahash(&kendryte_sha256_alg);
+-	goto out;
++	struct kendryte_hash_dev *hd;
++	int ret;
++
++	if (kendryte_hash)
++		return -EBUSY;
++
++	hd = devm_kzalloc(dev, sizeof(*hd), GFP_KERNEL);
++	if (!hd)
++		return -ENOMEM;
++	hd->dev = dev;
++
++	hd->hash_base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(hd->hash_base))
++		return PTR_ERR(hd->hash_base);
++	/* Shared with the AES driver, so mapped without claiming the region */
++	hd->dma_base = devm_ioremap(dev, PUF_DMA_BASE, PUF_BLOCK_SIZE);
++	hd->crypto_base = devm_ioremap(dev, PUF_CRYPTO_BASE, PUF_BLOCK_SIZE);
++	if (!hd->dma_base || !hd->crypto_base)
++		return -ENOMEM;
++
++	/* DMA_DSC_CFG_0 holds a 32-bit source address */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++	/*
++	 * Coherent: with a streaming buffer the engine now and then hashes
++	 * stale bytes, the cache clean not yet visible when the DMA starts.
++	 */
++	hd->bounce = dmam_alloc_coherent(dev, KENDRYTE_HASH_BOUNCE_SIZE,
++					 &hd->bounce_dma, GFP_KERNEL);
++	if (!hd->bounce)
++		return -ENOMEM;
++
++	kendryte_hash = hd;
++	ret = crypto_register_ahash(&kendryte_sha256_alg);
++	if (ret) {
++		kendryte_hash = NULL;
++		return dev_err_probe(dev, ret, "cannot register sha256\n");
++	}
++	return 0;
+ }
+ 
+-static int kendryte_sha256_remove(struct platform_device *pdev)
++static int kendryte_hash_remove(struct platform_device *pdev)
+ {
+ 	crypto_unregister_ahash(&kendryte_sha256_alg);
+-
++	kendryte_hash = NULL;
+ 	return 0;
+ }
+ 
+@@ -600,8 +356,8 @@ static const struct of_device_id of_kendryte_sha256_ids[] = {
+ MODULE_DEVICE_TABLE(of, of_kendryte_sha256_ids);
+ 
+ static struct platform_driver kendryte_sha256_driver = {
+-	.probe = kendryte_sha256_probe,
+-	.remove = kendryte_sha256_remove,
++	.probe = kendryte_hash_probe,
++	.remove = kendryte_hash_remove,
+ 	.driver = {
+ 		.name = "kendryte-sha256",
+ 		.of_match_table = of_kendryte_sha256_ids,
+diff --git a/drivers/crypto/canaan/kendryte-hash.h b/drivers/crypto/canaan/kendryte-hash.h
+index 4a4037e63..6d9c51f31 100644
+--- a/drivers/crypto/canaan/kendryte-hash.h
++++ b/drivers/crypto/canaan/kendryte-hash.h
+@@ -9,175 +9,40 @@
+ #ifndef __KENDRYTE_HASH_H__
+ #define __KENDRYTE_HASH_H__
+ 
+-#define HMAC_SW_KEY_MAXLEN 64
+-#define HMAC_BLOCK_MAXLEN 128
+-#define DGST_INT_STATE_LEN 64
+-#define DLEN_MAX 64
+-
+-//----------------------DMA REGISTER OFFSET----------------------------------------//
+-#define DMA_STAT_0_OFFSET 0x10
+-#define DMA_STAT_1_OFFSET 0x14
+-#define DMA_START_OFFSET 0x20
+-#define DMA_CFG_0_OFFSET 0x24
+-#define DMA_DSC_CFG_0_OFFSET 0x34
+-#define DMA_DSC_CFG_1_OFFSET 0x38
+-#define DMA_DSC_CFG_2_OFFSET 0x3c
+-#define DMA_DSC_CFG_3_OFFSET 0x40
+-#define DMA_DSC_CFG_4_OFFSET 0x44
+-#define DMA_KEY_CFG_0_OFFSET 0x6c
+-//----------------------DMA REGISTER BIT----------------------------------------//
+-#define DMA_KEY_CFG_0_KEY_DST_BITS 4
+-#define DMA_KEY_CFG_0_KEY_SIZE_BITS 8
+-#define DMA_KEY_CFG_0_KEY_IDX_BITS 24
+-
+-#define DMA_DSC_CFG_4_WRITE_PROT_BITS 0
+-#define DMA_DSC_CFG_4_READ_PROT_BITS 8
+-#define DMA_DSC_CFG_4_FIX_READ_BITS 16
+-#define DMA_DSC_CFG_4_FIX_WRITE_BITS 17
+-#define DMA_DSC_CFG_4_NO_CRYP_BITS 23
+-#define DMA_DSC_CFG_4_OFFSET_BITS 24
+-#define DMA_DSC_CFG_4_DN_PAUSE_BITS 28
+-#define DMA_DSC_CFG_4_DN_INTRPT_BITS 29
+-#define DMA_DSC_CFG_4_TAIL_BITS 30
+-#define DMA_DSC_CFG_4_HEAD_BITS 31
+-//----------------------DMA REGISTER BIT MASKS----------------------------------//
+-#define DMA_STATUS_0_BUSY_MASK 0x00000001
+-
+-//----------------------CRYPTO REGISTER OFFSET---------------------------------------//
+-#define CRYPTO_IV_OFFSET 0x30
+-#define CRYPTO_SW_KEY_OFFSET 0x40
+-#define CRYPTO_DGST_IN_OFFSET 0x80
+-#define CRYPTO_DGST_OUT_OFFSET 0xc0
+-
+-//----------------------HASH REGISTER OFFSET----------------------------------------//
+-#define HASH_STATUS_OFFSET 0x10
+-#define HASH_CONFIG_OFFSET 0x18
+-#define HASH_PLEN_OFFSET 0x20
+-#define HASH_ALEN_OFFSET 0x30
+-//----------------------HASH REGISTER BIT MASKS----------------------------------//
+-#define HMAC_HASH_INTRPT_INTRPT_ST_MASK 0x00000001
+-#define HMAC_HASH_INTRPT_INTRPT_EN_MASK 0x00010000
+-#define HMAC_HASH_FEATURE_HMAC_MASK 0x00000001
+-#define HMAC_HASH_FEATURE_SHA2_MASK 0x00000002
+-#define HMAC_HASH_STATUS_BUSY_MASK 0x00000001
+-#define HMAC_HASH_STATUS_RESP_MASK 0xfffffffe
+-#define HMAC_HASH_CFG_VARIANT_MASK 0x00000007
+-#define HMAC_HASH_CFG_FUNC_MASK 0x00000100
+-#define HMAC_HASH_PLEN_VALUE_MASK 0xffffffff
+-#define HMAC_HASH_ALEN_VALUE_MASK 0xffffffff
+-
+-/**
+- * @brief Status code
+- */
+-enum kendryte_status_t {
+-	SUCCESS, ///< Success.
+-	E_ALIGN, ///< Address alignment mismatch.
+-	E_OVERFLOW, ///< Space overflow.
+-	E_UNDERFLOW, ///< Size too small.
+-	E_INVALID, ///< Invalid argument.
+-	E_BUSY, ///< Resource is occupied.
+-	E_UNAVAIL, ///< Resource is unavailable.
+-	E_FIRMWARE, ///< Firmware error.
+-	E_VERFAIL, ///< Invalid public key or digital signature.
+-	E_ECMPROG, ///< Invalid ECC microprogram.
+-	E_DENY, ///< Access denied.
+-	E_UNSUPPORT, ///< Not support.
+-	E_INFINITY, ///< Point at infinity.
+-	E_ERROR, ///< Unspecific error.
+-};
+-
+-/**
+- * @brief Key types
+- */
+-enum kendryte_key_type_t {
+-	SWKEY = 0,
+-	OTPKEY = 1,
+-	PUFKEY = 2,
+-	RANDKEY = 3,
+-	SHARESEC = 4,
+-	SSKEY = 5,
+-	PRKEY,
+-};
+-
+-/**
+- * @brief Algo types
+- */
+-enum kendryte_algo_type_t {
+-	ALGO_TYPE_HKDF = 0,
+-	ALGO_TYPE_HMAC,
+-	ALGO_TYPE_CMAC,
+-	ALGO_TYPE_KLB = 4,
+-	ALGO_TYPE_SM2ENC = 7,
+-	ALGO_TYPE_SP38A,
+-	ALGO_TYPE_GCM,
+-	ALGO_TYPE_XTS,
+-	ALGO_TYPE_CCM,
+-	ALGO_TYPE_CHACHA,
+-	ALGO_TYPE_CYPT_REG_IO,
+-	ALGO_TYPE_KEY_EXPORT,
+-	ALGO_TYPE_NONE,
+-};
+-
+-/**
+- * structure for segment() return value
+- */
+-struct segstr {
+-	bool process;
+-	const uint8_t *addr;
+-	uint32_t len;
+-};
+-
+-struct blsegs {
+-	uint32_t nsegs;
+-	struct segstr seg[3];
+-};
+-
+-enum kendryte_hash_t {
+-	SHA_224,
+-	SHA_256,
+-	SHA_384,
+-	SHA_512,
+-	SHA_512_224,
+-	SHA_512_256,
+-	SM3,
+-	N_HASH_T,
+-};
+-
+-enum hmac_op {
+-	HMAC_AVAILABLE,
+-	HMAC_HASH,
+-	HMAC_HMAC,
+-};
+-
+-struct kendryte_sha256_info {
+-	struct device *dev;
+-	struct clk *clk;
+-	struct reset_control *rst;
+-	void __iomem *base;
+-	int irq;
+-};
+-
+-struct kendryte_dgst_st {
+-	uint32_t dlen;
+-	uint8_t dgst[DLEN_MAX];
+-};
+-
+-struct kendryte_sha256_ctx {
+-	struct kendryte_sha256_info *dev;
+-
+-	uint8_t buff[HMAC_BLOCK_MAXLEN];
+-	uint8_t key[HMAC_BLOCK_MAXLEN];
+-	uint8_t state[DGST_INT_STATE_LEN];
+-	uint32_t buflen;
+-	uint32_t keybits;
+-	uint32_t minlen;
+-	uint32_t curlen;
+-	uint32_t keyslot;
+-	uint32_t blocklen;
+-	enum kendryte_key_type_t keytype;
+-	enum hmac_op op;
+-	enum kendryte_hash_t hash;
+-	bool start;
+-};
++/* PUF DMA and crypto register blocks; the hash block is the DT "reg" */
++#define PUF_DMA_BASE		0x91210000
++#define PUF_CRYPTO_BASE		0x91210100
++#define PUF_BLOCK_SIZE		0x100
++
++/* DMA registers */
++#define DMA_STAT_0_OFFSET	0x10
++#define DMA_START_OFFSET	0x20
++#define DMA_CFG_0_OFFSET	0x24
++#define DMA_DSC_CFG_0_OFFSET	0x34	/* source address */
++#define DMA_DSC_CFG_1_OFFSET	0x38	/* destination address */
++#define DMA_DSC_CFG_2_OFFSET	0x3c	/* length, bytes */
++#define DMA_DSC_CFG_4_OFFSET	0x44	/* block flags */
++#define DMA_KEY_CFG_0_OFFSET	0x6c
++
++#define DMA_STAT_0_BUSY		BIT(0)
++#define DMA_DSC_CFG_4_DN_PAUSE	BIT(28)
++#define DMA_DSC_CFG_4_DN_INTRPT	BIT(29)
++#define DMA_DSC_CFG_4_TAIL	BIT(30)	/* last block of the message */
++#define DMA_DSC_CFG_4_HEAD	BIT(31)	/* first block of the message */
++#define DMA_KEY_CFG_0_DST	GENMASK(7, 4)	/* key destination */
++#define DMA_KEY_DST_HMAC	1		/* HMAC/hash engine */
++
++/* Crypto registers: hash state in and out, 16 big-endian words */
++#define CRYPTO_DGST_IN_OFFSET	0x80
++#define CRYPTO_DGST_OUT_OFFSET	0xc0
++#define DGST_INT_STATE_LEN	64
++
++/* Hash registers */
++#define HASH_STATUS_OFFSET	0x10
++#define HASH_CONFIG_OFFSET	0x18
++#define HASH_PLEN_OFFSET	0x20	/* length so far: HASH_ALEN of the last block */
++#define HASH_ALEN_OFFSET	0x30	/* accumulated message length */
++
++#define HASH_CONFIG_SHA256	0x03
+ 
+ #endif /* __KENDRYTE_HASH_H__ */
+-- 
+2.43.0
+

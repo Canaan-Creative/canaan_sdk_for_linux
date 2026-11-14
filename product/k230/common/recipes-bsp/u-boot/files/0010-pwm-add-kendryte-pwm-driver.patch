@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] pwm: add kendryte pwm driver
+
+Add a driver model PWM driver for the K230 PWM controller, compatible
+"kendryte,pwm". Board code uses it to set the fan speed at boot.
+
+Upstream-Status: Pending
+---
+ drivers/pwm/Kconfig        |   6 ++
+ drivers/pwm/Makefile       |   1 +
+ drivers/pwm/pwm-kendryte.c | 145 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 152 insertions(+)
+ create mode 100644 drivers/pwm/pwm-kendryte.c
+
+diff --git a/drivers/pwm/Kconfig b/drivers/pwm/Kconfig
+index de312656..2f38d828 100644
+--- a/drivers/pwm/Kconfig
++++ b/drivers/pwm/Kconfig
+@@ -126,3 +126,9 @@ config PWM_TI_EHRPWM
+ 	default y
+ 	help
+ 	  PWM driver support for the EHRPWM controller found on TI SOCs.
++
++config PWM_KENDRYTE
++	bool "Enable support for Kendryte PWM"
++	depends on DM_PWM
++	help
++	  This PWM is found on CANAAN's K230 (Kendryte).
+diff --git a/drivers/pwm/Makefile b/drivers/pwm/Makefile
+index 76305b93..88c501a7 100644
+--- a/drivers/pwm/Makefile
++++ b/drivers/pwm/Makefile
+@@ -15,6 +15,7 @@ obj-$(CONFIG_PWM_AT91)		+= pwm-at91.o
+ obj-$(CONFIG_PWM_CADENCE_TTC)	+= pwm-cadence-ttc.o
+ obj-$(CONFIG_PWM_CROS_EC)	+= cros_ec_pwm.o
+ obj-$(CONFIG_PWM_EXYNOS)	+= exynos_pwm.o
++obj-$(CONFIG_PWM_KENDRYTE)	+= pwm-kendryte.o
+ obj-$(CONFIG_PWM_IMX)		+= pwm-imx.o
+ obj-$(CONFIG_PWM_MESON)		+= pwm-meson.o
+ obj-$(CONFIG_PWM_MTK)		+= pwm-mtk.o
+diff --git a/drivers/pwm/pwm-kendryte.c b/drivers/pwm/pwm-kendryte.c
+new file mode 100644
+index 00000000..4137dc94
+--- /dev/null
++++ b/drivers/pwm/pwm-kendryte.c
+@@ -0,0 +1,145 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2020 SiFive, Inc
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++/* Canaan K230 (Kendryte) PWM driver. */
++#include <clk.h>
++#include <div64.h>
++#include <dm.h>
++#include <pwm.h>
++#include <regmap.h>
++#include <asm/global_data.h>
++#include <linux/io.h>
++#include <linux/log2.h>
++#include <linux/bitfield.h>
++
++#ifndef NSEC_PER_SEC
++#define NSEC_PER_SEC 1000000000L
++#endif
++
++DECLARE_GLOBAL_DATA_PTR;
++
++struct pwm_kendryte_regs {
++	volatile uint32_t	pwmcfg;
++	volatile uint32_t	reserved0;
++	volatile uint32_t	pwmcount;
++	volatile uint32_t	reserved1;
++	volatile uint32_t	pwms;
++	volatile uint32_t	reserved2;
++	volatile uint32_t	reserved3;
++	volatile uint32_t	reserved4;
++	volatile uint32_t	pwmcmp0;
++	volatile uint32_t	pwmcmp1;
++	volatile uint32_t	pwmcmp2;
++	volatile uint32_t	pwmcmp3;
++};
++
++struct pwm_kendryte_priv {
++	void __iomem	*base;
++	ulong		freq;
++};
++
++static int pwm_kendryte_set_config(struct udevice *dev, uint channel,
++				   uint period_ns, uint duty_ns)
++{
++	struct pwm_kendryte_priv *priv = dev_get_priv(dev);
++	struct pwm_kendryte_regs *reg = priv->base;
++
++	debug("%s: period_ns=%u, duty_ns=%u\n", __func__, period_ns, duty_ns);
++
++	uint64_t period, pulse, pwmcmpx_max;
++	uint32_t pwmscale = 0;
++	uint64_t pwm_clock = priv->freq;
++
++	period = (pwm_clock * period_ns) / NSEC_PER_SEC;
++	pulse = (pwm_clock * duty_ns) / NSEC_PER_SEC;
++
++	if (pulse > period)
++		return -EINVAL;
++
++	if (period > ((1 << (15 + 16)) - 1LL))
++		return -EINVAL;
++
++	pwmcmpx_max = (1 << 16) - 1;
++	while ((period >> pwmscale) > pwmcmpx_max)
++		pwmscale++;
++
++	if (pwmscale > 0xf)
++		return -EINVAL;
++
++	reg->pwmcfg |= (1 << 9); //default always mode
++	reg->pwmcfg |= pwmscale;
++	reg->pwmcmp0 = (period >> pwmscale);
++
++	switch (channel) {
++	case 0:
++		reg->pwmcmp1 = (reg->pwmcmp0 - (pulse >> pwmscale));
++		break;
++	case 1:
++		reg->pwmcmp2 = (reg->pwmcmp0 - (pulse >> pwmscale));
++		break;
++	case 2:
++		reg->pwmcmp3 = (reg->pwmcmp0 - (pulse >> pwmscale));
++		break;
++	default:
++		break;
++	}
++	debug("%s: channel=%u, reg->pwmcmp3=0x%x 0x%lx\n", __func__, channel,
++	      reg->pwmcmp3, (ulong)&reg->pwmcmp3);
++	return 0;
++}
++
++static int pwm_kendryte_set_enable(struct udevice *dev, uint channel,
++				   bool enable)
++{
++	struct pwm_kendryte_priv *priv = dev_get_priv(dev);
++	struct pwm_kendryte_regs *reg = priv->base;
++
++	debug("%s: Enable '%s'\n", __func__, dev->name);
++
++	if (enable)
++		reg->pwmcfg |= (1 << 12);
++	else
++		reg->pwmcfg &= ~(1 << 12);
++
++	return 0;
++}
++
++static int pwm_kendryte_probe(struct udevice *dev)
++{
++	struct pwm_kendryte_priv *priv = dev_get_priv(dev);
++	struct clk clk;
++	int ret = 0;
++
++	ret = clk_get_by_index(dev, 0, &clk);
++	if (ret < 0) {
++		debug("%s get clock fail!\n", __func__);
++		return -EINVAL;
++	}
++
++	priv->freq = clk_get_rate(&clk);
++	priv->base = dev_read_addr_ptr(dev);
++
++	return 0;
++}
++
++static const struct pwm_ops pwm_kendryte_ops = {
++	.set_config = pwm_kendryte_set_config,
++	.set_enable = pwm_kendryte_set_enable,
++};
++
++static const struct udevice_id pwm_kendryte_ids[] = {
++	{ .compatible = "kendryte,pwm" },
++	{}
++};
++
++U_BOOT_DRIVER(pwm_kendryte) = {
++	.name = "pwm_kendryte",
++	.id = UCLASS_PWM,
++	.of_match = pwm_kendryte_ids,
++	.ops = &pwm_kendryte_ops,
++	.probe = pwm_kendryte_probe,
++	.priv_auto = sizeof(struct pwm_kendryte_priv),
++};
+-- 
+2.43.0
+

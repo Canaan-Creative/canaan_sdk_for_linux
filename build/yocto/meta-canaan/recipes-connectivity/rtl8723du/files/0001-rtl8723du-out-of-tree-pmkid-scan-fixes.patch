@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] rtl8723du: build out of tree and fix PMKID and scan disconnect
+
+Makefile: take $(src) from the Makefile's own path and include phydm.mk
+from it, strip debug information, build the module only when
+CONFIG_RTL8723DU is set, and drop the dkms and module-signing targets.
+
+rtw_mlme.c: leave an RSN IE that carries no PMKID unchanged instead of
+appending the cached PMKID.
+
+rtw_mlme_ext.c: on disconnect while scanning, report MLME_SCAN_DISABLE
+instead of warning about an unknown state.
+
+Upstream-Status: Pending
+---
+ Makefile            | 38 ++++++--------------------------------
+ core/rtw_mlme.c     |  2 +-
+ core/rtw_mlme_ext.c |  2 ++
+ 3 files changed, 9 insertions(+), 33 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 7952c19..ac65260 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,13 +7,12 @@ ifeq ($(GCC_VER_49),1)
+ EXTRA_CFLAGS += -Wno-date-time	# Fix compile error && warning on gcc 4.9 and later
+ endif
+ 
+-EXTRA_CFLAGS += -I$(src)/include
++mkfile_path := $(abspath $(lastword $(MAKEFILE_LIST)))
++src := $(patsubst %Makefile, %, $(mkfile_path))
+ 
+-#EXTRA_LDFLAGS += --strip-debug
++EXTRA_CFLAGS += -I$(src)/include
+ 
+-ifeq ("","$(wildcard MOK.der)")
+-NO_SKIP_SIGN := y
+-endif
++EXTRA_LDFLAGS += --strip-debug
+ 
+ ########################## Features ###########################
+ CONFIG_EFUSE_CONFIG_FILE = y
+@@ -65,7 +64,7 @@ _PLATFORM_FILES := platform/platform_ops.o
+ 
+ EXTRA_CFLAGS += -I$(src)/hal
+ 
+-include $(TopDIR)/hal/phydm/phydm.mk
++include $(src)/hal/phydm/phydm.mk
+ ########### HAL_RTL8723D #################################
+ 
+ MODULE_NAME = 8723du
+@@ -190,7 +189,7 @@ $(MODULE_NAME)-y += $(_PHYDM_FILES)
+ $(MODULE_NAME)-y += $(_BTC_FILES)
+ $(MODULE_NAME)-y += $(_PLATFORM_FILES)
+ 
+-obj-m := $(MODULE_NAME).o
++obj-$(CONFIG_RTL8723DU) := $(MODULE_NAME).o
+ 
+ else
+ 
+@@ -244,20 +243,6 @@ endif
+ 	@/sbin/depmod -a ${KVER}
+ 	@echo "Please reboot your system"
+ 
+-DRIVER_VERSION = $(shell grep "\#define DRIVERVERSION" include/drv_types.h | awk '{print $$3}' | tr -d v\")
+-
+-dkms_install:
+-	@mkdir -vp /usr/src/$(MODULE_NAME)-$(DRIVER_VERSION)
+-	cp -r * /usr/src/$(MODULE_NAME)-$(DRIVER_VERSION)
+-	dkms add -m $(MODULE_NAME) -v $(DRIVER_VERSION)
+-	+ dkms build -m $(MODULE_NAME) -v $(DRIVER_VERSION)
+-	dkms install -m $(MODULE_NAME) -v $(DRIVER_VERSION)
+-	dkms status -m $(MODULE_NAME)
+-
+-dkms_remove:
+-	dkms remove $(MODULE_NAME)/$(DRIVER_VERSION) --all
+-	rm -rf /usr/src/$(MODULE_NAME)-$(DRIVER_VERSION)
+-
+ config_r:
+ 	@echo "make config"
+ 	/bin/bash script/Configure script/config.in
+@@ -289,14 +274,3 @@ clean:
+ 	@rm -fr .tmp_versions
+ endif
+ 
+-sign:
+-ifeq ($(NO_SKIP_SIGN), y)
+-	@openssl req -new -x509 -newkey rsa:2048 -keyout MOK.priv -outform DER -out MOK.der -nodes -days 36500 -subj "/CN=Custom MOK/"
+-	@mokutil --import MOK.der
+-else
+-	echo "Skipping key creation"
+-endif
+-	@$(KSRC)/scripts/sign-file sha256 MOK.priv MOK.der 8723du.ko
+-
+-sign-install: all sign install
+-
+diff --git a/core/rtw_mlme.c b/core/rtw_mlme.c
+index 160bdba..2b45843 100644
+--- a/core/rtw_mlme.c
++++ b/core/rtw_mlme.c
+@@ -3270,7 +3270,7 @@ static int rtw_rsn_sync_pmkid(struct adapter *adapter, u8 *ie, uint ie_len, int
+ 		return 0;
+ 	}
+ 
+-	if (i_ent < 0 && info.pmkid_cnt == 0)
++	if (info.pmkid_cnt == 0)
+ 		goto exit;
+ 
+ 	if (i_ent >= 0 && info.pmkid_cnt == 1 && !memcmp(info.pmkid_list, sec->PMKIDList[i_ent].PMKID, 16)) {
+diff --git a/core/rtw_mlme_ext.c b/core/rtw_mlme_ext.c
+index a41ff21..49eca6b 100644
+--- a/core/rtw_mlme_ext.c
++++ b/core/rtw_mlme_ext.c
+@@ -10639,6 +10639,8 @@ static void rtw_mlmeext_disconnect(struct adapter *adapt)
+ 		self_action = MLME_ADHOC_STOPPED;
+ 	else if (MLME_IS_NULL(adapt))
+ 		self_action = MLME_ACTION_NONE;
++	else if (MLME_IS_SCAN(adapt))
++		self_action = MLME_SCAN_DISABLE;
+ 	else {
+ 		RTW_INFO("state:0x%x\n", MLME_STATE(adapt));
+ 		rtw_warn_on(1);

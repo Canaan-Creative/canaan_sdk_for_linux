@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] misc: canaan: power the ai domain from gnne and ai2d
+
+Let the AI power domain power off when unused: gnne and ai2d enable
+runtime PM, which powers the AI domain, enable ai_clk
+and ai_aclk at probe, set the KPU clock to 800 MHz with an exclusive
+rate, and release all of it on remove. The power domain driver does not
+mark the AI domain always on and registers it initially off, like the
+display and VPU domains.
+
+gnne leaves the sysctl power and clock registers alone on open and
+release; runtime PM and the clock framework own them.
+
+Upstream-Status: Pending
+---
+ drivers/misc/canaan/ai2d/k230_ai2d.c    | 13 ++++
+ drivers/misc/canaan/gnne/k230_gnne.c    | 92 +++++++++++++++----------
+ drivers/soc/canaan/k230-power-domains.c |  4 +-
+ 3 files changed, 69 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/misc/canaan/ai2d/k230_ai2d.c b/drivers/misc/canaan/ai2d/k230_ai2d.c
+index fdd97db25..76e4d8e1c 100644
+--- a/drivers/misc/canaan/ai2d/k230_ai2d.c
++++ b/drivers/misc/canaan/ai2d/k230_ai2d.c
+@@ -35,6 +35,13 @@
+ #include <linux/irq.h>
+ #include <linux/interrupt.h>
+ #include <linux/poll.h>
++#include <linux/clk.h>
++#include <linux/pm_runtime.h>
++
++extern int ai_disable_power_and_clk(struct platform_device *pdev, int num_clks,
++				    struct clk_bulk_data *clks);
++extern int ai_enable_power_and_clk(struct platform_device *pdev, int num_clks,
++				   struct clk_bulk_data *clks);
+ 
+ #ifdef MODULE_IMPORT_NS
+ MODULE_IMPORT_NS(DMA_BUF);
+@@ -67,6 +74,7 @@ struct ai2d_plat {
+ 	struct device *dev;
+ 	struct cdev cdev;
+ 	struct list_head dmabuf;
++	struct clk_bulk_data clks[2];
+ };
+ 
+ static struct ai2d_plat *plat;
+@@ -326,6 +334,10 @@ static int ai2d_probe(struct platform_device *pdev)
+ 	}
+ 	plat->dev = &pdev->dev;
+ 
++	err = ai_enable_power_and_clk(pdev, ARRAY_SIZE(plat->clks), plat->clks);
++	if (err < 0)
++		goto cleanup_cdev;
++
+ 	return 0;
+ 
+ cleanup_cdev:
+@@ -351,6 +363,7 @@ static int ai2d_remove(struct platform_device *pdev)
+ 	class_destroy(plat->class);
+ 	iounmap(plat->regs);
+ 	free_irq(plat->irq, NULL);
++	ai_disable_power_and_clk(pdev, ARRAY_SIZE(plat->clks), plat->clks);
+ 	kfree(plat);
+ 
+ 	return 0;
+diff --git a/drivers/misc/canaan/gnne/k230_gnne.c b/drivers/misc/canaan/gnne/k230_gnne.c
+index 357369e36..6cb9c5df7 100644
+--- a/drivers/misc/canaan/gnne/k230_gnne.c
++++ b/drivers/misc/canaan/gnne/k230_gnne.c
+@@ -35,6 +35,8 @@
+ #include <linux/interrupt.h>
+ #include <linux/poll.h>
+ #include <linux/dma-mapping.h>
++#include <linux/clk.h>
++#include <linux/pm_runtime.h>
+ 
+ #define gnne_writeq(v, addr)                       \
+ 	{                                         \
+@@ -51,6 +53,7 @@ struct gnne_plat {
+ 	struct class *class;
+ 	struct device *device;
+ 	struct cdev cdev;
++	struct clk_bulk_data clks[2];
+ };
+ 
+ static struct gnne_plat *plat;
+@@ -105,52 +108,14 @@ static unsigned int gnne_poll(struct file *file, poll_table *wait)
+ 
+ static int gnne_open(struct inode *inode, struct file *filp)
+ {
+-	void __iomem *sysctl_reg;
+-
+ 	gnne_int_flag = 0;
+-
+-	sysctl_reg = ioremap(0x91103028, 4);
+-	if (!sysctl_reg) {
+-		pr_err("can't remap gnne sysctl 0x%08X\n", 0x91103028);
+-		return -1;
+-	}
+-	iowrite32(0x00030002, sysctl_reg);
+-	iounmap(sysctl_reg);
+-
+-	sysctl_reg = ioremap(0x91100008, 4);
+-	if (!sysctl_reg) {
+-		pr_err("can't remap gnne sysctl 0x%08X\n", 0x91100008);
+-		return -1;
+-	}
+-	iowrite32(0x80000405, sysctl_reg);
+-	iowrite32(0x80000405, sysctl_reg);
+-	iounmap(sysctl_reg);
+-
+ 	return 0;
+ }
+ 
+ static int gnne_release(struct inode *inode, struct file *filp)
+ {
+-	void __iomem *sysctl_reg;
+ 
+ 	gnne_int_flag = 0;
+-
+-	sysctl_reg = ioremap(0x91103028, 4);
+-	if (!sysctl_reg) {
+-		pr_err("can't remap gnne sysctl 0x%08X\n", 0x91103028);
+-		return -1;
+-	}
+-	iowrite32(0x00030001, sysctl_reg);
+-	iounmap(sysctl_reg);
+-
+-	sysctl_reg = ioremap(0x91100008, 4);
+-	if (!sysctl_reg) {
+-		pr_err("can't remap gnne sysctl 0x%08X\n", 0x91100008);
+-		return -1;
+-	}
+-	iowrite32(0x00000404, sysctl_reg);
+-	iounmap(sysctl_reg);
+-
+ 	return 0;
+ }
+ 
+@@ -162,6 +127,51 @@ const struct file_operations gnne_fops = {
+ 	.fasync = gnne_drv_fasync,
+ };
+ 
++int ai_enable_power_and_clk(struct platform_device *pdev, int num_clks,
++			    struct clk_bulk_data *clks)
++{
++	int err = 0;
++
++	pm_runtime_enable(&pdev->dev);
++	err = pm_runtime_resume_and_get(&pdev->dev);
++	if (err < 0)
++		goto err_pm_disable;
++
++	clks[0].id = "ai_clk";
++	clks[1].id = "ai_aclk";
++	err = devm_clk_bulk_get(&pdev->dev, num_clks, clks);
++	if (err < 0)
++		goto err_pm_put;
++
++	err = clk_bulk_prepare_enable(num_clks, clks);
++	if (err < 0)
++		goto err_clk_disable;
++
++	err = clk_set_rate(clks[0].clk, 800000000);
++	if (err < 0)
++		goto err_clk_disable;
++	clk_rate_exclusive_get(clks[0].clk);
++	return 0;
++
++err_clk_disable:
++	clk_bulk_disable_unprepare(num_clks, clks);
++err_pm_put:
++	pm_runtime_put_sync(&pdev->dev);
++err_pm_disable:
++	pm_runtime_disable(&pdev->dev);
++
++	return err;
++}
++
++int ai_disable_power_and_clk(struct platform_device *pdev, int num_clks,
++			     struct clk_bulk_data *clks)
++{
++	clk_rate_exclusive_put(clks[0].clk);
++	clk_bulk_disable_unprepare(num_clks, clks);
++	pm_runtime_put_sync(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
++	return 0;
++}
+ static int gnne_probe(struct platform_device *pdev)
+ {
+ 	struct resource *res;
+@@ -241,6 +251,11 @@ static int gnne_probe(struct platform_device *pdev)
+ 		goto cleanup_cdev;
+ 	}
+ 
++	err = ai_enable_power_and_clk(pdev, ARRAY_SIZE(plat->clks), plat->clks);
++
++	if (err)
++		goto cleanup_cdev;
++
+ 	return 0;
+ 
+ cleanup_cdev:
+@@ -266,6 +281,7 @@ static int gnne_remove(struct platform_device *pdev)
+ 	class_destroy(plat->class);
+ 	iounmap(plat->regs);
+ 	free_irq(plat->irq, NULL);
++	ai_disable_power_and_clk(pdev, ARRAY_SIZE(plat->clks), plat->clks);
+ 	kfree(plat);
+ 
+ 	return 0;
+diff --git a/drivers/soc/canaan/k230-power-domains.c b/drivers/soc/canaan/k230-power-domains.c
+index 22b79ae74..91fa29183 100644
+--- a/drivers/soc/canaan/k230-power-domains.c
++++ b/drivers/soc/canaan/k230-power-domains.c
+@@ -157,7 +157,6 @@ int k230_pd_probe(struct platform_device *pdev,
+ 		return PTR_ERR(sysctl_power_base);
+ 
+ 	k230_pm_domains[K230_PM_DOMAIN_CPU1]->flags |= GENPD_FLAG_ALWAYS_ON;
+-	k230_pm_domains[K230_PM_DOMAIN_AI]->flags |= GENPD_FLAG_ALWAYS_ON;
+ 	// k230_pm_domains[K230_PM_DOMAIN_VPU]->flags |= GENPD_FLAG_ALWAYS_ON;
+ 	k230_pm_domains[K230_PM_DOMAIN_DPU]->flags |= GENPD_FLAG_ALWAYS_ON;
+ 
+@@ -165,7 +164,8 @@ int k230_pd_probe(struct platform_device *pdev,
+ 		k230_pm_domains[i]->power_on = k230_power_on;
+ 		k230_pm_domains[i]->power_off = k230_power_off;
+ 
+-		if (i == K230_PM_DOMAIN_DISP || i == K230_PM_DOMAIN_VPU)
++		if (i == K230_PM_DOMAIN_DISP || i == K230_PM_DOMAIN_VPU ||
++		    i == K230_PM_DOMAIN_AI)
+ 			pm_genpd_init(k230_pm_domains[i], NULL, true);
+ 		else
+ 			pm_genpd_init(k230_pm_domains[i], NULL, false);
+-- 
+2.43.0
+

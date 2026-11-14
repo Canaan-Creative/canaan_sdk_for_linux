@@ -1,0 +1,91 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026, Canaan Creative Co., Ltd.
+#
+# For the licensing terms, see the LICENSE file (MIT License).
+#
+# NO WARRANTY. The Software is provided "AS IS", without warranty of any kind, express or
+# implied, including but not limited to the warranties of merchantability, fitness for a
+# particular purpose and non-infringement. In no event shall the authors or copyright
+# holders be liable for any claim, damages or other liability arising from, out of or in
+# connection with the Software or the use or other dealings in the Software.
+
+### BEGIN INIT INFO
+# Provides:        miner-web
+# Default-Start:   2 3 4 5
+# Default-Stop:    0 1 6
+# Short-Description: Avalon miner web app (civetweb)
+### END INIT INFO
+
+: "${DAEMON:=/usr/sbin/miner_web}"
+: "${LOG_DIR:=/data/userdata/log}"
+PORT=80
+CREDS=/data/userconfig/systemcfg.ini
+PIDFILE=/var/run/miner-web.pid
+LOG=$LOG_DIR/miner.log
+# Restart delay after miner_web exits, doubling up to the maximum while it
+# keeps exiting within RESTART_RESET_S of its start, s
+RESTART_MIN_S=3
+RESTART_MAX_S=60
+RESTART_RESET_S=60
+
+mlog() {
+    printf '[%s.000] [%s] miner-web: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG"
+}
+
+uptime_s() {
+    cut -d. -f1 /proc/uptime
+}
+
+# Run miner_web and start it again whenever it exits; SIGTERM stops both.
+supervise() {
+    child=
+    trap '[ -n "$child" ] && kill "$child" 2>/dev/null; exit 0' TERM INT
+    delay=$RESTART_MIN_S
+    while :; do
+        started=$(uptime_s)
+        "$DAEMON" "$PORT" "$CREDS" >> "$LOG" 2>&1 &
+        child=$!
+        wait "$child"
+        rc=$?
+        child=
+        [ $(($(uptime_s) - started)) -ge $RESTART_RESET_S ] && delay=$RESTART_MIN_S
+        mlog ERR "miner_web exited (status $rc); restarting in $delay s"
+        # In the background, so that SIGTERM ends the wait at once.
+        sleep "$delay" &
+        child=$!
+        wait "$child"
+        child=
+        delay=$((delay * 2))
+        [ "$delay" -gt $RESTART_MAX_S ] && delay=$RESTART_MAX_S
+    done
+}
+
+case "$1" in
+    start)
+        echo "Starting the web dashboard on port 443 (HTTPS), 8443 (REST) and $PORT (HTTP)"
+        if [ -x /usr/sbin/avalon-data-mount.sh ] && ! /usr/sbin/avalon-data-mount.sh; then
+            echo "  WARN: data partition not mounted; web access messages are saved on the root" \
+                "file system, not on the data partition" >&2
+        fi
+        mkdir -p "$LOG_DIR"
+        start-stop-daemon -S -b -m -p $PIDFILE -x /bin/sh -- "$0" supervise
+        ;;
+    stop)
+        echo "Stopping the web dashboard"
+        start-stop-daemon -K -p $PIDFILE 2>/dev/null
+        rm -f $PIDFILE
+        ;;
+    restart)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
+    supervise)
+        supervise
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

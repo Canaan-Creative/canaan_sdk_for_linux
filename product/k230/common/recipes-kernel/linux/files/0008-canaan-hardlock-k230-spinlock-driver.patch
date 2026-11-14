@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] canaan-hardlock: add the k230 hardware spinlock driver
+
+Add a driver for the K230 hardware spinlock block, compatible
+canaan,k230-hardlock, and the <linux/canaan-hardlock.h> API:
+request_lock() reserves a lock number, hardlock_lock() tries to take it
+and hardlock_unlock() releases it. Each of the HARDLOCK_MAX locks is one
+register; reading zero takes the lock and writing zero releases it.
+
+Until the device has probed, the calls succeed without touching the
+hardware, so drivers that take a lock also work on boards that do not
+describe the block.
+
+Upstream-Status: Pending
+---
+ drivers/canaan-hardlock/Kconfig           |  10 ++
+ drivers/canaan-hardlock/Makefile          |   7 ++
+ drivers/canaan-hardlock/canaan-hardlock.c | 122 ++++++++++++++++++++++
+ include/linux/canaan-hardlock.h           |  11 ++
+ 4 files changed, 150 insertions(+)
+ create mode 100644 drivers/canaan-hardlock/Kconfig
+ create mode 100644 drivers/canaan-hardlock/Makefile
+ create mode 100644 drivers/canaan-hardlock/canaan-hardlock.c
+ create mode 100644 include/linux/canaan-hardlock.h
+
+diff --git a/drivers/canaan-hardlock/Kconfig b/drivers/canaan-hardlock/Kconfig
+new file mode 100644
+index 000000000..a7c23f340
+--- /dev/null
++++ b/drivers/canaan-hardlock/Kconfig
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (c) 2026, Canaan Creative Co., Ltd.
++
++menu "canaan-hardlock"
++
++config CANAAN_HARDLOCK
++	bool "canaan hardlock driver"
++	default y
++
++endmenu
+diff --git a/drivers/canaan-hardlock/Makefile b/drivers/canaan-hardlock/Makefile
+new file mode 100644
+index 000000000..e726443fd
+--- /dev/null
++++ b/drivers/canaan-hardlock/Makefile
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (c) 2026, Canaan Creative Co., Ltd.
++#
++# Makefile for the hardlock drivers.
++#
++
++obj-$(CONFIG_CANAAN_HARDLOCK)		+= canaan-hardlock.o
+diff --git a/drivers/canaan-hardlock/canaan-hardlock.c b/drivers/canaan-hardlock/canaan-hardlock.c
+new file mode 100644
+index 000000000..bcf0805e5
+--- /dev/null
++++ b/drivers/canaan-hardlock/canaan-hardlock.c
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++#include <linux/kernel.h>
++#include <linux/of.h>
++#include <linux/io.h>
++#include <linux/platform_device.h>
++#include <linux/printk.h>
++#include <linux/canaan-hardlock.h>
++
++#define CANAAN_DRIVER_NAME "hard-lock"
++
++struct canaan_hardlock {
++	void __iomem	*base;
++	char		used[HARDLOCK_MAX];
++};
++
++static struct canaan_hardlock *hardlock;
++
++int hardlock_lock(int num)
++{
++	if (!hardlock)
++		return 0;
++
++	if (num < 0 || num >= HARDLOCK_MAX)
++		return -1;
++
++	if (!readl(hardlock->base + num * 0x4)) {
++		pr_debug("hardlock-%d locked\n", num);
++		return 0;
++	}
++	pr_debug("hardlock-%d is busy\n", num);
++	return -1;
++}
++EXPORT_SYMBOL(hardlock_lock);
++
++int hardlock_unlock(int num)
++{
++	if (!hardlock)
++		return 0;
++
++	if (num < 0 || num >= HARDLOCK_MAX)
++		return -1;
++
++	if (readl(hardlock->base + num * 0x4)) {
++		writel(0x0, hardlock->base + num * 0x4);
++		pr_debug("hardlock-%d unlock\n", num);
++		return 0;
++	}
++	pr_err("hardlock-%d unlock failed\n", num);
++	return -1;
++}
++EXPORT_SYMBOL(hardlock_unlock);
++
++int request_lock(int num)
++{
++	if (!hardlock)
++		return 0;
++
++	if (num < 0 || num >= HARDLOCK_MAX)
++		return -1;
++
++	if (!hardlock->used[num]) {
++		hardlock->used[num] = 1;
++		return 0;
++	}
++
++	pr_err("request hardlock failed, hardlock-%d is used\n", num);
++	return -1;
++}
++EXPORT_SYMBOL(request_lock);
++
++static int canaan_hardlock_probe(struct platform_device *pdev)
++{
++	struct resource *reg;
++	void __iomem *base;
++
++	hardlock = devm_kzalloc(&pdev->dev, sizeof(*hardlock), GFP_KERNEL);
++	if (!hardlock)
++		return -ENOMEM;
++
++	reg = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	base = devm_ioremap_resource(&pdev->dev, reg);
++	if (IS_ERR(base)) {
++		hardlock = NULL;
++		return PTR_ERR(base);
++	}
++	hardlock->base = base + 0xa0; /* hardlock offset */
++
++	platform_set_drvdata(pdev, hardlock);
++	printk("Canaan Hard Lock Driver init.\n");
++	return 0;
++}
++
++static const struct of_device_id canaan_hardlock_match[] = {
++	{ .compatible = "canaan,k230-hardlock" },
++	{}
++};
++
++static struct platform_driver canaan_hardlock_driver = {
++	.driver = {
++		.name = CANAAN_DRIVER_NAME,
++		.of_match_table = of_match_ptr(canaan_hardlock_match),
++	},
++	.probe = canaan_hardlock_probe,
++};
++
++static int __init hardlock_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&canaan_hardlock_driver);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++subsys_initcall(hardlock_init);
++
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/canaan-hardlock.h b/include/linux/canaan-hardlock.h
+new file mode 100644
+index 000000000..49756fe3d
+--- /dev/null
++++ b/include/linux/canaan-hardlock.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++#ifndef __CANAAN_HARDLOCK_H__
++#define __CANAAN_HARDLOCK_H__
++#define HARDLOCK_MAX 128
++int hardlock_lock(int num);
++int hardlock_unlock(int num);
++int request_lock(int num);
++#endif
+-- 
+2.43.0
+

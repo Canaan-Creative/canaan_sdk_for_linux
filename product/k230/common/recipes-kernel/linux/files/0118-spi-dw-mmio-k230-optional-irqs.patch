@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] spi: dw-mmio: make the k230 per-source interrupts optional
+
+dw_spi_canaan_k230_init() reads one interrupt per source and stops at
+the first one missing. Use platform_get_irq_optional() so that a node
+with fewer interrupts does not log an error for the missing ones.
+
+Upstream-Status: Pending
+---
+ drivers/spi/spi-dw-mmio.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/spi/spi-dw-mmio.c b/drivers/spi/spi-dw-mmio.c
+index 21782006f..5a43b36f9 100644
+--- a/drivers/spi/spi-dw-mmio.c
++++ b/drivers/spi/spi-dw-mmio.c
+@@ -278,7 +278,7 @@ static int dw_spi_canaan_k230_init(struct platform_device *pdev,
+ 	dwsmmio->dws.ip = DW_HSSI_ID;
+ 	dwsmmio->dws.caps = DW_SPI_CAP_INDEP_IRQ;
+ 	for (i = 1; i < ARRAY_SIZE(dwsmmio->dws.irqs); i++) {
+-		irq = platform_get_irq(pdev, i);
++		irq = platform_get_irq_optional(pdev, i);
+ 		if (irq < 0)
+ 			return 0;
+ 		dwsmmio->dws.irqs[i - 1] = irq;
+-- 
+2.43.0
+

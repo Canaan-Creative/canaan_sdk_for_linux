@@ -1,0 +1,47 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026, Canaan Creative Co., Ltd.
+#
+# For the licensing terms, see the LICENSE file (MIT License).
+#
+# NO WARRANTY. The Software is provided "AS IS", without warranty of any kind, express or
+# implied, including but not limited to the warranties of merchantability, fitness for a
+# particular purpose and non-infringement. In no event shall the authors or copyright
+# holders be liable for any claim, damages or other liability arising from, out of or in
+# connection with the Software or the use or other dealings in the Software.
+
+### BEGIN INIT INFO
+# Provides:          release-version
+# Required-Start:
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+# Short-Description: Print the rootfs build identity on the console
+### END INIT INFO
+#
+# Installed into the rootfs, together with its /etc/rcS.d/S02 link, by
+# canaan-release-version.bbclass at image build time. It belongs to no package,
+# so it carries no update-rc.d registration; /etc/init.d/rcS finds it purely by
+# the rcS.d symlink and forks it as `release-version start`.
+#
+# /etc/release_version is written by the same class and names the SDK commit the
+# ROOTFS was built from. Two short lines, because a technician reads this over a
+# serial console and the miner's own start-up output follows immediately after.
+
+RELEASE_VERSION_FILE=/etc/release_version
+
+# Never fail the boot over a missing identity file.
+[ -r "$RELEASE_VERSION_FILE" ] || exit 0
+
+# shellcheck source=/dev/null
+. "$RELEASE_VERSION_FILE"
+
+miner=""
+[ -n "$MINER_VERSION" ] && miner=" miner$MINER_VERSION"
+
+echo "rootfs: $MACHINE sdk$SDK_VERSION$miner"
+# GIT_COMMIT is bare, with a trailing "t" when the tree was dirty; "t" is not a
+# hex digit, so the suffix cannot be mistaken for part of the sha.
+echo "rootfs: built $BUILD_TIME $GIT_COMMIT"
+
+exit 0

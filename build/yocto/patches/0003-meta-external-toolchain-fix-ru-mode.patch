@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] meta-external-toolchain: open files without the removed rU mode
+
+Upstream-Status: Pending
+---
+ recipes-external/glibc/glibc-external.bb | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/recipes-external/glibc/glibc-external.bb b/recipes-external/glibc/glibc-external.bb
+index 34c04be..f686f66 100644
+--- a/recipes-external/glibc/glibc-external.bb
++++ b/recipes-external/glibc/glibc-external.bb
+@@ -29,7 +29,7 @@ def get_external_libc_license(d):
+         if found:
+             errno_paths = found[0]
+             if errno_paths:
+-                with open(errno_paths[0], 'rU') as f:
++                with open(errno_paths[0], 'r') as f:
+                     text = f.read()
+ 
+                 lictext = """   The GNU C Library is free software; you can redistribute it and/or
+-- 
+2.43.0
+

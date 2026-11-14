@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: make the generic reset_cpu() weak
+
+The K230 resets through a register in its system controller. Make the
+generic reset_cpu(), used when SYSRESET is disabled, weak so that SoC
+code can provide its own.
+
+Upstream-Status: Pending
+---
+ arch/riscv/cpu/cpu.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/arch/riscv/cpu/cpu.c b/arch/riscv/cpu/cpu.c
+index 15c4e145..e5e03ac5 100644
+--- a/arch/riscv/cpu/cpu.c
++++ b/arch/riscv/cpu/cpu.c
+@@ -724,7 +724,8 @@ __weak void harts_early_init(void)
+ }
+ 
+ #if !CONFIG_IS_ENABLED(SYSRESET)
+-void reset_cpu(void)
++/* __weak so SoC code (e.g. arch/riscv/cpu/k230/cpu.c) can provide its own. */
++__weak void reset_cpu(void)
+ {
+ 	printf("resetting ...\n");
+ 
+-- 
+2.43.0
+

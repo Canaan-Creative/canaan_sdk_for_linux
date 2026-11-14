@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] spi: build the k230 enhanced dw-ssi driver
+
+Add the SPI_DW_MMIO_K230 option and build spi-dw-core-k230.o and
+spi-dw-mmio-k230.o with it.
+
+Upstream-Status: Pending
+---
+ drivers/spi/Kconfig  | 7 +++++++
+ drivers/spi/Makefile | 2 ++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/drivers/spi/Kconfig b/drivers/spi/Kconfig
+index 83c1ee0f5..d0a4d98cb 100644
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -316,6 +316,13 @@ config SPI_DW_PCI
+ 	tristate "PCI interface driver for DW SPI core"
+ 	depends on PCI
+ 
++config SPI_DW_MMIO_K230
++	tristate "Memory-mapped io interface driver for K230 DW SPI core"
++	depends on HAS_IOMEM
++	help
++	  Canaan K230 enhanced DW-SSI driver with SPI-NAND (quad + raw OOB)
++	  support. Binds snps,dwc-ssi-1.01a-k230.
++
+ config SPI_DW_MMIO
+ 	tristate "Memory-mapped io interface driver for DW SPI core"
+ 	depends on HAS_IOMEM
+diff --git a/drivers/spi/Makefile b/drivers/spi/Makefile
+index b2f672f2b..28eb2d022 100644
+--- a/drivers/spi/Makefile
++++ b/drivers/spi/Makefile
+@@ -157,3 +157,5 @@ obj-$(CONFIG_SPI_AMD)			+= spi-amd.o
+ # SPI slave protocol handlers
+ obj-$(CONFIG_SPI_SLAVE_TIME)		+= spi-slave-time.o
+ obj-$(CONFIG_SPI_SLAVE_SYSTEM_CONTROL)	+= spi-slave-system-control.o
++obj-$(CONFIG_SPI_DW_MMIO_K230)	+= spi-dw-mmio-k230.o
++obj-$(CONFIG_SPI_DW_MMIO_K230)	+= spi-dw-core-k230.o
+-- 
+2.43.0
+

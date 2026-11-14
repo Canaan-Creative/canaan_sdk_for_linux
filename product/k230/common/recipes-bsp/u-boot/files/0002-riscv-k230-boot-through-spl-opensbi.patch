@@ -1,0 +1,504 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: k230: boot through spl and opensbi
+
+The K230 boards load U-Boot from SPL and hand over to Linux through
+OpenSBI. Replace CANAAN_K230 with RISCV_THEAD, which enables SPL,
+OpenSBI and FIT loading, and add DDR_SIZE. Build the C908 support files
+with the compatibility header. cpu.c sets up the core CSRs, the mtimer
+clock and the system reset, flushes the data cache before Linux starts
+and adds the boot_baremetal command that starts the second core. dram.c
+configures the DDR PLL and runs the DDR init sequence.
+
+Upstream-Status: Pending
+---
+ arch/riscv/cpu/k230/Kconfig  |  19 ++-
+ arch/riscv/cpu/k230/Makefile |  15 +++
+ arch/riscv/cpu/k230/cpu.c    | 144 +++++++++++++++++++++
+ arch/riscv/cpu/k230/dram.c   | 237 ++++++++++++++++++++++++++++++++++-
+ 4 files changed, 410 insertions(+), 5 deletions(-)
+
+diff --git a/arch/riscv/cpu/k230/Kconfig b/arch/riscv/cpu/k230/Kconfig
+index d76ad92a..2878cabc 100644
+--- a/arch/riscv/cpu/k230/Kconfig
++++ b/arch/riscv/cpu/k230/Kconfig
+@@ -1,14 +1,25 @@
+ # SPDX-License-Identifier: GPL-2.0+
+ #
+ # Copyright (c) 2025, Junhui Liu <junhui.liu@pigmoral.tech>
++# Copyright (C) 2017-2020 Alibaba Group Holding Limited
++# Copyright (c) 2026, Canaan Creative Co., Ltd.
+ 
+-config CANAAN_K230
++config RISCV_THEAD
+ 	bool
+ 	select ARCH_EARLY_INIT_R
+-	select BINMAN
++	select SUPPORT_SPL
+ 	imply CPU
+ 	imply CPU_RISCV
+ 	imply RISCV_TIMER
++	imply RISCV_RDTIME
+ 	imply CMD_CPU
+-	imply SYSRESET
+-	imply SYSRESET_SYSCON
++	imply SPL_CPU
++	imply SPL_OPENSBI
++	imply SPL_LOAD_FIT
++
++config DDR_SIZE
++	hex "DDR Size"
++	default 0x08000000 if SIPLP4_2667
++	default 0x20000000
++	help
++	  Size of the DDR
+\ No newline at end of file
+diff --git a/arch/riscv/cpu/k230/Makefile b/arch/riscv/cpu/k230/Makefile
+index 6e321cf3..57001469 100644
+--- a/arch/riscv/cpu/k230/Makefile
++++ b/arch/riscv/cpu/k230/Makefile
+@@ -1,6 +1,21 @@
+ # SPDX-License-Identifier: GPL-2.0+
+ #
+ # Copyright (c) 2025, Junhui Liu <junhui.liu@pigmoral.tech>
++# Copyright (c) 2026, Canaan Creative Co., Ltd.
+ 
+ obj-y += dram.o
+ obj-y += cpu.o
++obj-y += cache.o
++
++obj-y += sysctl.o
++# K230 HW-accelerated gunzip (UGZIP @ 0x80808000 + SDMA). Linked as a strong
++# override of lib/gunzip.c's __weak gunzip(). If HW path fails at runtime,
++# gunzip() falls through to the SW zlib path in stand_gunzip() (same file).
++# Trigger: image gzip CM byte (offset 2) = 0x09; standard 0x08 stays SW-only.
++obj-y += unzip.o
++# Auto-include the K230 compat shim + downgrade GCC 14 strict warnings.
++ccflags-y += -include $(srctree)/arch/$(ARCH)/cpu/k230/k230_compat.h
++ccflags-y += -Wno-error=int-conversion -Wno-error=incompatible-pointer-types
++ccflags-y += -Wno-error=implicit-function-declaration -Wno-error=unused-function
++ccflags-y += -Wno-error=pointer-to-int-cast -Wno-error=int-to-pointer-cast
++EXTRA_CFLAGS += -I$(srctree)/arch/$(ARCH)/cpu/k230
+diff --git a/arch/riscv/cpu/k230/cpu.c b/arch/riscv/cpu/k230/cpu.c
+index 417a25f0..2e870ffd 100644
+--- a/arch/riscv/cpu/k230/cpu.c
++++ b/arch/riscv/cpu/k230/cpu.c
+@@ -1,9 +1,153 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*
+  * Copyright (c) 2025, Junhui Liu <junhui.liu@pigmoral.tech>
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
+  */
+ 
++#include <asm/types.h>
++#include <asm/asm.h>
++#include <asm/csr.h>
++#include <cpu_func.h>
++#include <fdt_support.h>
++#include <asm/io.h>
++#include <command.h>
++#include <spl.h>
++#include <asm/cache.h>
++#include <linux/delay.h>
++#include "platform.h"
++
++/* XuanTie C9xx M-mode CSRs, by number: the toolchain has no names for them. */
++#define K230_CSR_MXSTATUS 0x7c0 /* T-Head extension status: MAEE, THEADISAEE, PAN */
++#define K230_CSR_MHCR 0x7c1 /* L1 cache enable/config */
++#define K230_CSR_MCOR 0x7c2 /* cache operation register */
++#define K230_CSR_MCCR2 0x7c3 /* cache config 2 */
++#define K230_CSR_MHINT 0x7c5 /* branch predictor / prefetch */
++#define K230_CSR_MSMPR 0x7f3 /* SMP/shared-mem protocol enable */
++
++/* Cache, branch predictor, prefetch and SMP CSR settings. */
++static inline void improving_cpu_performance_subset(void)
++{
++	csr_write(K230_CSR_MCOR, 0x70013);
++	csr_write(K230_CSR_MCCR2, 0xe0000009);
++	csr_write(K230_CSR_MHCR, 0x11ff); /* full L1 cache enable + BPU */
++	csr_write(K230_CSR_MXSTATUS, 0x638000); /* MAEE + theadisaee + PAN ... */
++	csr_write(K230_CSR_MHINT, 0x6e30c);
++	csr_write(K230_CSR_MSMPR, 0x1);
++}
++
++/*
++ * cleanup_before_linux() is called just before Linux starts. It writes the
++ * data cache back to DDR.
++ */
+ int cleanup_before_linux(void)
+ {
++	/*
++	 * Keep the I/D caches on: OpenSBI and the Linux head.S expect them on
++	 * at handoff. With them off, early kernel init slows down by seconds
++	 * and the UART output at the OpenSBI to Linux handoff is intermittently
++	 * garbled.
++	 */
++	flush_dcache_all();
++	asm volatile(".long 0x0170000b\n" ::: "memory"); /* l2cache.ciall */
++
++	return 0;
++}
++
++void harts_early_init(void)
++{
++	/*enable mtimer clk*/
++	writel(0x1, (volatile void __iomem *)0x91108020);
++	writel(0x1, (volatile void __iomem *)0x91108030);
++	writel(0x69, (volatile void __iomem *)0x91108000);
++
++	record_boot_time_info_to_sram("et");
++
++	writel(0x80199805, (void *)0x91100004);
++
++	writel(0x0, (void *)SYSCTL_PWR_BASE_ADDR + 0x158);
++
++	/*
++	 * Leave the PMP entries unlocked: a locked entry (L=1) persists until
++	 * reset and makes the OpenSBI PMP probe report pmp_count=1 and
++	 * addr_bits=30, after which OpenSBI cannot configure its root-domain
++	 * region.
++	 */
++
++	/* Needed for HW UGZIP cache coherency. */
++	improving_cpu_performance_subset();
++}
++
++u32 spl_boot_device(void)
++{
++	return BOOT_DEVICE_MMC1;
++}
++
++typedef void (*func_app_entry)(void);
++static int k230_boot_baremetal(struct cmd_tbl *cmdtp, int flag, int argc,
++			       char *const argv[])
++{
++	static ulong boot_address, boot_size, boot_cpu;
++
++	if (argc < 4)
++		return CMD_RET_USAGE;
++
++	boot_cpu = hextoul(argv[1], NULL);
++	boot_address = hextoul(argv[2], NULL);
++	boot_size = hextoul(argv[3], NULL);
++
++	flush_cache(boot_address, boot_size);
++	if (boot_cpu) {
++#if defined(CONFIG_RT_SMART_RUN_CORE_ID)
++		/*
++		 * Starting hart1 touches the shared L2 and PLIC: disable the
++		 * hart0 L1 caches and flush the L2 first so that hart0 keeps
++		 * running from memory.
++		 */
++		icache_disable();
++		dcache_disable();
++		asm volatile(".long 0x0170000b\n" ::: "memory"); /* l2cache.ciall */
++#endif
++		writel(boot_address, (void *)0x91102104ULL); /* hart1 reset vector */
++		udelay(100);
++		writel(0x10001000, (void *)0x9110100c);
++		udelay(100);
++		writel(0x10001, (void *)0x9110100c);
++		udelay(100);
++		writel(0x10000, (void *)0x9110100c);
++	} else {
++		func_app_entry app_entry = (void *)(long)boot_address;
++
++		app_entry();
++	}
++
++	return 0;
++}
++
++U_BOOT_CMD_COMPLETE(boot_baremetal, 4, 1, k230_boot_baremetal, "boot_baremetal",
++		    "\n boot_baremetal cpu addr size\n", NULL);
++
++/*
++ * K230 system reset: write 0x10001 to the sysctl boot reset register at
++ * SYSCTL_BOOT_BASE_ADDR + 0x60. Overrides the weak reset_cpu() in
++ * arch/riscv/cpu/cpu.c; reset_misc() resets the same way.
++ */
++void reset_cpu(void)
++{
++	printf("resetting ...\n");
++#ifndef CONFIG_XPL_BUILD
++	writel(0x10001, (void *)(uintptr_t)(SYSCTL_BOOT_BASE_ADDR + 0x60));
++#endif
++	while (1)
++		;
++}
++
++int reset_misc(void)
++{
++	printf("reboot system\n");
++#ifndef CONFIG_XPL_BUILD
++	writel(0x10001, (void *)(uintptr_t)(SYSCTL_BOOT_BASE_ADDR + 0x60));
++#endif
++	while (1)
++		;
+ 	return 0;
+ }
+diff --git a/arch/riscv/cpu/k230/dram.c b/arch/riscv/cpu/k230/dram.c
+index b2d3e4fd..ba83a34c 100644
+--- a/arch/riscv/cpu/k230/dram.c
++++ b/arch/riscv/cpu/k230/dram.c
+@@ -1,17 +1,235 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*
+  * Copyright (C) 2018, Bin Meng <bmeng.cn@gmail.com>
++ * Copyright (C) 2017-2020 Alibaba Group Holding Limited
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
+  */
+ 
+-#include <asm/global_data.h>
+ #include <fdtdec.h>
+ #include <init.h>
+ #include <linux/sizes.h>
++#include <asm/io.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
++#define BOOT_REG_BASE (0x91102000)
++#define PLL0_CFG0 (BOOT_REG_BASE + 0x0)
++#define PLL0_CFG1 (BOOT_REG_BASE + 0x4)
++#define PLL0_CTL (BOOT_REG_BASE + 0x8)
++#define PLL0_STAT (BOOT_REG_BASE + 0xC)
++#define PLL1_CFG0 (BOOT_REG_BASE + 0x10)
++#define PLL1_CFG1 (BOOT_REG_BASE + 0x14)
++#define PLL1_CTL (BOOT_REG_BASE + 0x18)
++#define PLL1_STAT (BOOT_REG_BASE + 0x1C)
++#define PLL2_CFG0 (BOOT_REG_BASE + 0x20)
++#define PLL2_CFG1 (BOOT_REG_BASE + 0x24)
++#define PLL2_CTL (BOOT_REG_BASE + 0x28)
++#define PLL2_STAT (BOOT_REG_BASE + 0x2C)
++#define PLL3_CFG0 (BOOT_REG_BASE + 0x30)
++#define PLL3_CFG1 (BOOT_REG_BASE + 0x34)
++#define PLL3_CTL (BOOT_REG_BASE + 0x38)
++#define PLL3_STAT (BOOT_REG_BASE + 0x3C)
++
++static void pd_pll(uint32_t pll_ctl, uint32_t pll_stat)
++{
++	int rdata;
++
++	writel(0x10001, pll_ctl);
++	rdata = readl(pll_stat);
++	while ((rdata & 0x30) != 0x0)
++		rdata = readl(pll_stat);
++}
++
++static void init_pll(uint32_t pll_ctl, uint32_t pll_stat)
++{
++	int rdata;
++
++	writel(0x20002, pll_ctl);
++	rdata = readl(pll_stat);
++	while ((rdata & 0x30) != 0x20)
++		rdata = readl(pll_stat);
++}
++
++static uint32_t cfg_pll(int fb_div, int ref_div, int out_div, int pllx_cfg0,
++			int pllx_cfg1, int pllx_ctl, int pllx_stat)
++{
++	pd_pll(pllx_ctl, pllx_stat);
++	writel(((fb_div / 4) | 0x20000), pllx_cfg1); //for minimum long term jitter
++	writel(((fb_div & 0x1fff) | ((ref_div & 0x3f) << 16) |
++		((out_div & 0xf) << 24)),
++	       pllx_cfg0);
++	init_pll(pllx_ctl, pllx_stat);
++}
++
++uint32_t cfg_pll_npd(int fb_div, int ref_div, int out_div, int pllx_cfg0,
++		     int pllx_cfg1, int pllx_ctl, int pllx_stat)
++{
++	writel(((fb_div / 2) | 0x20000), pllx_cfg1);
++	writel(((fb_div & 0x1fff) | ((ref_div & 0x3f) << 16) |
++		((out_div & 0xf) << 24)),
++	       pllx_cfg0);
++	init_pll(pllx_ctl, pllx_stat);
++}
++
++static int change_pll_2660(void)
++{
++	//Note: The recommended value for BWADJ is FBK_DIV/2.Valid values range from 0 to 0xFFF.
++	//To minimize long-term jitter, using NB=NF/4 is better. NB = BWADJ[11:0] + 1,
++	//So, BWADJ=(NB-1)=[NF/2 -1] or (NF/4 -1)--minimize long term jitter
++
++	cfg_pll(110, //fb_div=NF-1
++		0, //ref_div=NR-1
++		0, //out_div=OD-1
++		PLL2_CFG0, PLL2_CFG1, PLL2_CTL, PLL2_STAT);
++
++	*(uint32_t *)(0x91100060) = 0x800043fe; //switch ddrc_core_clk source to pll2div4
++
++	udelay(50);
++}
++
++#define PWR_REG_BASE (0x91103000)
++#define PMU_PWR_LPI_CTL (PWR_REG_BASE + 0x158)
++#define SSYS_CTL_GPIO_CTL (PWR_REG_BASE + 0x168)
++#define SSYS_CTL_GPIO_EN0 (PWR_REG_BASE + 0x170)
++#define SSYS_CTL_GPIO_EN1 (PWR_REG_BASE + 0x174)
++#define SHRM_PWR_LPI_CTL (PWR_REG_BASE + 0x68)
++
++#define BOOT_REG_BASE (0x91102000)
++#define SOC_SLEEP_CTL (BOOT_REG_BASE + 0x6C)
++#define SOC_SLEEP_MASK (BOOT_REG_BASE + 0x118)
++
++#define PMU_REG_BASE (0x91000000)
++#define PMU_INT0_TO_CTRL (PMU_REG_BASE + 0x0040)
++#define PMU_INT1_TO_CTRL (PMU_REG_BASE + 0x0044)
++#define PMU_INT_TO_CPU (PMU_REG_BASE + 0x0048)
++#define PMU_INT_DETECT_EN (PMU_REG_BASE + 0x004C)
++#define PMU_INT_DETECT_CLR (PMU_REG_BASE + 0x0054)
++#define PMU_SYSCTRL_REG (PMU_REG_BASE + 0x0078)
++#define PMU_NORMAL_TIMER_VAL (PMU_REG_BASE + 0x00A0)
++#define PMU_OUT_LOGIC_CTRL (PMU_REG_BASE + 0x00A8)
++
++#define RTC_REG_BASE 0x91000c00
++#define DATE (RTC_REG_BASE + 0x0)
++#define TIME (DATE + 0x4)
++#define ALARM_DATE (TIME + 0x4)
++#define ALARM_TIME (ALARM_DATE + 0x4)
++#define COUNT (ALARM_TIME + 0x4)
++#define INT_CTRL (COUNT + 0x4)
++
++uint32_t alarm_test(uint8_t century, uint8_t year, uint8_t month, uint8_t day,
++		    uint8_t week, uint8_t hour, uint8_t minute, uint8_t second,
++
++		    uint8_t alarm_century, uint8_t alarm_year,
++		    uint8_t alarm_month, uint8_t alarm_day, uint8_t alarm_week,
++		    uint8_t alarm_hour, uint8_t alarm_minute,
++		    uint8_t alarm_second, uint8_t alarm_intr_type)
++{
++	uint32_t wdata = 0;
++	uint32_t rdata = 0;
++
++	uint8_t leap_year = 0;
++
++	writel(0xff << 16, COUNT);
++	//set alarm date and time
++	wdata = (0x1f & alarm_day << 0);
++	wdata |= ((0xf & alarm_month) << 8);
++	wdata |= ((0x7f & alarm_year) << 16);
++	wdata |= ((0x1 & leap_year) << 23);
++	wdata |= ((0x7f & alarm_century) << 24);
++	writel(wdata, ALARM_DATE);
++
++	wdata = ((0x7 & alarm_week) << 24);
++	wdata |= ((0x1f & alarm_hour) << 16);
++	wdata |= ((0x3f & alarm_minute) << 8);
++	wdata |= ((0x3f & alarm_second) << 0);
++	writel(wdata, ALARM_TIME);
++
++	//set date and time
++	wdata = ((0x1f & day) << 0);
++	wdata |= ((0xf & month) << 8);
++	wdata |= ((0x7f & year) << 16);
++	wdata |= ((0x1 & leap_year) << 23);
++	wdata |= ((0x7f & century) << 24);
++	writel(wdata, DATE);
++
++	wdata = ((0x7 & week) << 24);
++	wdata |= ((0x1f & hour) << 16);
++	wdata |= ((0x3f & minute) << 8);
++	wdata |= ((0x3f & second) << 0);
++	writel(wdata, TIME);
++
++	//enable alarm_int
++	wdata = 0x1;
++	wdata |= 0x1 << 1;
++	wdata |= 0x1 << 16; //int mode
++	wdata |= ((0x7f & alarm_intr_type) << 24);
++	writel(wdata, INT_CTRL);
++
++	rdata = readl(INT_CTRL);
++	rdata &= 0xfffffffe;
++	rdata |= 1 << 17;
++	writel(rdata, INT_CTRL);
++}
++
++void change_pll0(void)
++{
++	uint32_t rdata;
++
++	writel(0x0, PMU_PWR_LPI_CTL);
++	udelay(500000);
++	writel(0x0, SSYS_CTL_GPIO_EN0);
++	writel(0x0, SSYS_CTL_GPIO_EN1);
++	writel(1 << 3, SSYS_CTL_GPIO_CTL);
++	writel(3, PMU_SYSCTRL_REG);
++	writel(0xe, PMU_OUT_LOGIC_CTRL);
++	writel(0x4, PMU_INT_DETECT_EN); //en int6 from rtc alarm_int
++	writel(0x0, PMU_INT0_TO_CTRL);
++	writel(0x0, PMU_INT1_TO_CTRL);
++	writel(0xffffffff, PMU_INT_DETECT_CLR);
++
++	writel(0x4, PMU_INT_TO_CPU); //enable int6:rtc_alarm
++	udelay(200); //wait pmu write_done
++	writel(0xffffffff, SOC_SLEEP_MASK); //mask shrm&ddr&pmu
++
++	writel(0x100000, SHRM_PWR_LPI_CTL); //ai_repair/shrm not repair
++	cfg_pll_npd(0x7f, 0x0, 0x1, PLL0_CFG0, PLL0_CFG1, PLL0_CTL, PLL0_STAT);
++
++	alarm_test(20, 100, 12, 31, 6, 23, 59, 59, 21, 1, 1, 1, 0, 0, 0, 0, 1);
++
++	rdata = 0x0;
++	rdata = readl(SOC_SLEEP_CTL);
++	rdata |= (1 << 0); //sleep_req
++	rdata |= (1 << 16); //wen
++	writel(rdata, SOC_SLEEP_CTL);
++
++	udelay(100);
++	printf("I am wakeup!\n");
++	printf("SYS_CTL_INT2_RAW:0x%x SOC_WAKUP_SRC:0x%x \n",
++	       *(uint32_t *)0x911020b0, *(uint32_t *)0x91102078);
++
++	writel(0x0, PMU_INT_DETECT_EN);
++	writel(0x0, PMU_INT_TO_CPU);
++	alarm_test(20, 100, 12, 31, 6, 23, 59, 59, 21, 1, 1, 1, 0, 0, 0, 0, 0);
++}
++
++void sip_ddr_init_2667(void);
++
++__weak int ddr_init_training(void)
++{
++	if ((readl((const volatile void __iomem *)0x980001bcULL) & 0x1) != 0)
++		return 0; /* already initialized */
++
++	change_pll_2660();
++	sip_ddr_init_2667();
++
++	return 0;
++}
++
+ int dram_init(void)
+ {
++#ifndef CONFIG_SPL
++	ddr_init_training();
++#endif
+ 	return fdtdec_setup_mem_size_base();
+ }
+ 
+@@ -19,3 +237,20 @@ int dram_init_banksize(void)
+ {
+ 	return fdtdec_setup_memory_banksize();
+ }
++
++phys_addr_t board_get_usable_ram_top(phys_size_t total_size)
++{
++#ifdef CONFIG_64BIT
++	/*
++	 * Ensure that we run from first 4GB so that all
++	 * addresses used by U-Boot are 32bit addresses.
++	 *
++	 * This in-turn ensures that 32bit DMA capable
++	 * devices work fine because DMA mapping APIs will
++	 * provide 32bit DMA addresses only.
++	 */
++	if (gd->ram_top > SZ_4G)
++		return SZ_4G;
++#endif
++	return gd->ram_top;
++}
+-- 
+2.43.0
+

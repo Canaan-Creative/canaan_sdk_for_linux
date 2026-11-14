@@ -1,0 +1,93 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026, Canaan Creative Co., Ltd.
+#
+# For the licensing terms, see the LICENSE file (MIT License).
+#
+# NO WARRANTY. The Software is provided "AS IS", without warranty of any kind, express or
+# implied, including but not limited to the warranties of merchantability, fitness for a
+# particular purpose and non-infringement. In no event shall the authors or copyright
+# holders be liable for any claim, damages or other liability arising from, out of or in
+# connection with the Software or the use or other dealings in the Software.
+
+### BEGIN INIT INFO
+# Provides:          rtl8723d-bt-reprobe
+# Required-Start:    $local_fs
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:
+# Short-Description: Rebind btusb so btrtl loads the RTL8723D firmware
+### END INIT INFO
+#
+# The built-in btusb sets up the RTL8723DU controller before the root
+# filesystem is mounted, so btrtl cannot read rtl_bt/ and the setup fails
+# without a retry. Rebinding the interface runs the setup again with
+# /lib/firmware readable. Runs before bluetoothd.
+#
+# hciN is created at probe time and the firmware is downloaded afterwards.
+# The kernel reads the BD address only once setup has succeeded, so a
+# non-zero address in hciconfig means the firmware is loaded. Without a
+# mgmt user the controller powers off again 2 s later, so UP is not a
+# usable test.
+
+USB_VENDOR=0bda
+USB_PRODUCT=d723
+DRV=/sys/bus/usb/drivers/btusb
+WAIT_S=8
+
+# btusb binds interface 0 and claims the isochronous interface itself.
+find_intf() {
+    for dev in /sys/bus/usb/devices/*; do
+        [ "$(cat "$dev/idVendor" 2>/dev/null)" = "$USB_VENDOR" ] || continue
+        [ "$(cat "$dev/idProduct" 2>/dev/null)" = "$USB_PRODUCT" ] || continue
+        echo "${dev##*/}:$(cat "$dev/bConfigurationValue").0"
+        return 0
+    done
+    return 1
+}
+
+reprobe() {
+    if ! intf=$(find_intf); then
+        echo "rtl8723d-bt-reprobe: RTL8723DU not found; Bluetooth unavailable" >&2
+        return
+    fi
+
+    [ -e "$DRV/$intf" ] && echo "$intf" > "$DRV/unbind" 2>/dev/null
+    echo "$intf" > "$DRV/bind" 2>/dev/null
+
+    n=0
+    hci=
+    while [ "$n" -lt "$WAIT_S" ]; do
+        for path in "/sys/bus/usb/devices/$intf/bluetooth"/hci*; do
+            [ -e "$path" ] && hci=${path##*/}
+        done
+        if [ -n "$hci" ] &&
+            hciconfig "$hci" 2>/dev/null | grep 'BD Address: ' |
+            grep -qv 'BD Address: 00:00:00:00:00:00'; then
+            return
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+    if [ -z "$hci" ]; then
+        echo "rtl8723d-bt-reprobe: no HCI device on $intf after ${WAIT_S} s;" \
+            "Bluetooth unavailable" >&2
+    else
+        echo "rtl8723d-bt-reprobe: $hci firmware not loaded after ${WAIT_S} s;" \
+            "Bluetooth unavailable" >&2
+    fi
+}
+
+case "$1" in
+start)
+    reprobe
+    ;;
+stop)
+    ;;
+*)
+    echo "Usage: $0 {start|stop}" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] spi: dw: bound the rx drain and log transfer errors at debug
+
+dw_spi_write_then_read() polls the RX FIFO with interrupts off and
+spins forever if the controller stops delivering data. Return -EIO
+after 100000 consecutive polls with an empty FIFO.
+
+Log the CS de-assertion, RX FIFO overflow and mem-op timeout errors at
+debug level. The SPI-NAND layers retry the operation, and the messages
+flood the log on marginal read timing.
+
+Upstream-Status: Pending
+---
+ drivers/spi/spi-dw-core.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/spi/spi-dw-core.c b/drivers/spi/spi-dw-core.c
+index 511d8bdb9..63fae10d2 100644
+--- a/drivers/spi/spi-dw-core.c
++++ b/drivers/spi/spi-dw-core.c
+@@ -577,7 +577,7 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
+ 	while (len) {
+ 		entries = readl_relaxed(dws->regs + DW_SPI_TXFLR);
+ 		if (!entries) {
+-			dev_err(&dws->host->dev, "CS de-assertion on Tx\n");
++			dev_dbg(&dws->host->dev, "CS de-assertion on Tx\n");
+ 			return -EIO;
+ 		}
+ 		room = min(dws->fifo_len - entries, len);
+@@ -592,16 +592,24 @@ static int dw_spi_write_then_read(struct dw_spi *dws, struct spi_device *spi)
+ 	 */
+ 	len = dws->rx_len;
+ 	buf = dws->rx;
++	unsigned int idle_polls = 0;
+ 	while (len) {
+ 		entries = readl_relaxed(dws->regs + DW_SPI_RXFLR);
+ 		if (!entries) {
++			if (++idle_polls > 100000) {
++				dev_dbg(&dws->host->dev,
++					"RX FIFO stuck (no data for %u polls, len=%u)\n",
++					idle_polls, len);
++				return -EIO;
++			}
+ 			sts = readl_relaxed(dws->regs + DW_SPI_RISR);
+ 			if (sts & DW_SPI_INT_RXOI) {
+-				dev_err(&dws->host->dev, "FIFO overflow on Rx\n");
++				dev_dbg(&dws->host->dev, "FIFO overflow on Rx\n");
+ 				return -EIO;
+ 			}
+ 			continue;
+ 		}
++		idle_polls = 0;
+ 		entries = min(entries, len);
+ 		for (; entries; --entries, --len)
+ 			*buf++ = dw_read_io_reg(dws, DW_SPI_DR);
+@@ -638,7 +646,7 @@ static int dw_spi_wait_mem_op_done(struct dw_spi *dws)
+ 		spi_delay_exec(&delay, NULL);
+ 
+ 	if (retry < 0) {
+-		dev_err(&dws->host->dev, "Mem op hanged up\n");
++		dev_dbg(&dws->host->dev, "Mem op hanged up\n");
+ 		return -EIO;
+ 	}
+ 
+-- 
+2.43.0
+

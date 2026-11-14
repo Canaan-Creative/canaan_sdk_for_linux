@@ -1,0 +1,9 @@
+# Configuration file for ifup(8) and ifdown(8).
+
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet manual
+    up ip link set $IFACE up || true
+    up udhcpc -b -t 1 -T 1 -A 2 -s /etc/network/udhcpc-eth0.script -p /var/run/udhcpc.$IFACE.pid -i $IFACE || true

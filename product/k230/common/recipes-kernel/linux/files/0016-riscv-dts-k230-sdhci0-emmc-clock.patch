@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: clock sdhci0 from a 200 MHz fixed clock
+
+sdhci0 is the eMMC controller and runs up to 200 MHz. Give it its own
+200 MHz fixed clock, dummy_emmc, instead of the SD card clock.
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/k230.dtsi | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+index a49a9820e..866fc0738 100644
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -194,6 +194,13 @@ dummy_sd:apb-sdclock {
+ 		#clock-cells = <0x00>;
+ 	};
+ 
++	dummy_emmc: apb-emmcclock {
++		compatible = "fixed-clock";
++		clock-frequency = <200000000>;
++		clock-output-names = "dummy_emmc";
++		#clock-cells = <0x00>;
++	};
++
+ 	clk_dummy: clock-dummy {
+ 		compatible = "fixed-clock";
+ 		clock-frequency = <0>;
+@@ -340,7 +347,7 @@ mmc_sd0: sdhci0@91580000 {
+ 			reg = <0x0 0x91580000 0x0 0x1000>;
+ 			interrupts = <142 IRQ_TYPE_LEVEL_HIGH>;
+ 			interrupt-names = "sdhci0irq";
+-			clocks = <&dummy_sd>,<&dummy_sd>;
++			clocks = <&dummy_emmc>, <&dummy_emmc>;
+ 			clock-names = "core", "bus";
+ 			max-frequency = <200000000>;
+ 			bus-width = <8>;
+-- 
+2.43.0
+

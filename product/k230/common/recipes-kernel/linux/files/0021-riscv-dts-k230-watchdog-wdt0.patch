@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: describe the watchdog as wdt0 at 375 kHz
+
+The K230 watchdog that the system uses is wdt0 at 0x91106000 on PLIC
+source 107. Rewrite the wdt1@91106800 node in place as
+watchdog0: wdt0@91106000 rather than adding a second node: with two
+enabled snps,dw-wdt instances both register with the watchdog core and
+/dev/watchdog binds to whichever probes first.
+
+wdt0 is clocked from osc24m through a 1..64 divider, and nothing in
+Linux programs that divider unless the device tree asks for a rate.
+assigned-clocks and assigned-clock-rates = <375000> make the k230
+composite clock select div = 64 before dw_wdt_probe() reads the rate.
+
+At 375 kHz the DesignWare timeout periods (2^(16+i) counts) give the
+whole-second grid
+
+  0 0 0 1 2 5 11 22 44 89 178 357 715 1431 2863 5726
+
+so an 89 s timeout is period i=9 (2^25 / 375000 = 89.478 s), and with
+the pre-timeout armed dw_wdt grants a pre-timeout of 89 s and a timeout
+of 178 s.
+
+The PLIC uses two interrupt cells and the soc node supplies the
+interrupt parent, so the interrupt is <107 IRQ_TYPE_LEVEL_HIGH>; dw_wdt
+requests IRQF_TRIGGER_RISING, which overrides the type at request time.
+The node has no resets property, so dw_wdt_stop() leaves
+WDOG_HW_RUNNING set.
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/k230.dtsi | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+index 051289e0c..50a17fb02 100644
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -426,11 +426,13 @@ i2c4: i2c@91409000 {
+ 			status = "disabled";
+ 		};
+ 
+-		watchdog1: wdt1@91106800 {
++		watchdog0: wdt0@91106000 {
+ 			compatible = "snps,dw-wdt";
+-			reg = <0x0 0x91106800 0x0 0x800>;
+-			interrupts = <108 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&wdt1>;
++			reg = <0x0 0x91106000 0x0 0x800>;
++			interrupts = <107 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&wdt0>;
++			assigned-clocks = <&wdt0>;
++			assigned-clock-rates = <375000>;
+ 		};
+ 
+ 		adc: adc@9140d000 {
+-- 
+2.43.0
+

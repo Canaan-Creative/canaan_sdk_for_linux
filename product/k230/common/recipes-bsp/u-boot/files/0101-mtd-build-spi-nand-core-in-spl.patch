@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] mtd: build the spi-nand core in spl
+
+The K230 SPL loads U-Boot from SPI-NAND through MTD while raw NAND
+support is disabled. Descend into drivers/mtd/nand/ and build the NAND
+core and the SPI-NAND drivers in SPL when MTD_SPI_NAND is enabled.
+
+Upstream-Status: Pending
+---
+ drivers/mtd/Makefile      | 3 +++
+ drivers/mtd/nand/Makefile | 4 ++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/drivers/mtd/Makefile b/drivers/mtd/Makefile
+index ce05e206..34eebc34 100644
+--- a/drivers/mtd/Makefile
++++ b/drivers/mtd/Makefile
+@@ -35,6 +35,9 @@ ifneq ($(mtd-y),)
+ obj-$(CONFIG_SPL_MTD) += mtd.o
+ endif
+ obj-$(CONFIG_$(PHASE_)NAND_SUPPORT) += nand/
++# K230: SPL needs to descend into nand/ for SPI-NAND boot even if raw NAND
++# (SPL_NAND_SUPPORT) is off. nand/Makefile gates the rest by CONFIG_MTD_SPI_NAND.
++obj-$(CONFIG_MTD_SPI_NAND) += nand/
+ obj-$(CONFIG_SPL_ONENAND_SUPPORT) += onenand/
+ obj-$(CONFIG_$(PHASE_)SPI_FLASH_SUPPORT) += spi/
+ obj-$(CONFIG_SPL_UBI) += ubispl/
+diff --git a/drivers/mtd/nand/Makefile b/drivers/mtd/nand/Makefile
+index c8169cf7..7eadaba9 100644
+--- a/drivers/mtd/nand/Makefile
++++ b/drivers/mtd/nand/Makefile
+@@ -6,5 +6,9 @@ obj-$(CONFIG_MTD_NAND_CORE) += nandcore.o
+ obj-$(CONFIG_MTD_RAW_NAND) += raw/
+ obj-$(CONFIG_MTD_SPI_NAND) += spi/
+ else
++# K230 SPL boots from SPI-NAND via MTD — build nandcore + spi/ in SPL too.
++nandcore-objs := core.o bbt.o
++obj-$(CONFIG_MTD_NAND_CORE) += nandcore.o
++obj-$(CONFIG_MTD_SPI_NAND) += spi/
+ obj-$(CONFIG_$(PHASE_)NAND_SUPPORT) += raw/
+ endif
+-- 
+2.43.0
+

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] crypto: canaan: build the k230 puf dma lock
+
+Add the hidden CRYPTO_DEV_KENDRYTE_PUF symbol for the drivers of the
+engines that share the PUF DMA channel to select, and build
+kendryte-puf.o when it is set.
+
+Upstream-Status: Pending
+---
+ drivers/crypto/canaan/Kconfig  | 3 +++
+ drivers/crypto/canaan/Makefile | 2 ++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/drivers/crypto/canaan/Kconfig b/drivers/crypto/canaan/Kconfig
+index de3bd7e3d..d49d63133 100644
+--- a/drivers/crypto/canaan/Kconfig
++++ b/drivers/crypto/canaan/Kconfig
+@@ -24,6 +24,9 @@ config CRYPTO_DEV_KENDRYTE_HASH
+         Supporting sha256 hashing
+         algo.
+ 
++config CRYPTO_DEV_KENDRYTE_PUF
++    tristate
++
+ config CRYPTO_DEV_KENDRYTE_RSA
+     tristate "Support for k230 rsa-2048 accelerator"
+     select CRYPTO_SKCIPHER
+diff --git a/drivers/crypto/canaan/Makefile b/drivers/crypto/canaan/Makefile
+index 57206d9a8..0b9fefcd8 100644
+--- a/drivers/crypto/canaan/Makefile
++++ b/drivers/crypto/canaan/Makefile
+@@ -2,6 +2,8 @@
+ #
+ # Canaan AES-GCM Makefile
+ #
++obj-$(CONFIG_CRYPTO_DEV_KENDRYTE_PUF) += kendryte-puf.o
++
+ obj-$(CONFIG_CRYPTO_DEV_KENDRYTE_CRYP) += kendryte_crypto.o
+ kendryte_crypto-objs := kendryte-aes.o
+ 
+-- 
+2.43.0
+

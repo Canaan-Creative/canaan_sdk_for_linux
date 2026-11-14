@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] watchdog: dw_wdt: record a kernel panic for the next boot
+
+A kernel panic reboots the board without passing through the miner, so
+the next boot reads no boot reason and looks like a power-on.
+
+Write the on-chip SRAM record from a panic notifier as well, with the
+text "linux panic\n" in place of "linux wdt timeout\n". Probe tells the
+two apart by the text: a panic record sets WDIOF_EXTERN1 in bootstatus,
+a pre-timeout record WDIOF_CARDRESET as before. No watchdog flag names
+a panic; WDIOF_EXTERN1 is otherwise unused by this driver.
+
+The notifier is registered only when the record region is mapped and is
+unregistered through devm, so a probe that fails later leaves none
+behind. A panic after a pre-timeout overwrites the pre-timeout record.
+
+Upstream-Status: Pending
+---
+ drivers/watchdog/dw_wdt.c | 53 +++++++++++++++++++++++++++++++++------
+ 1 file changed, 46 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/watchdog/dw_wdt.c b/drivers/watchdog/dw_wdt.c
+index 3ac13d5..bea15ec 100644
+--- a/drivers/watchdog/dw_wdt.c
++++ b/drivers/watchdog/dw_wdt.c
+@@ -25,6 +25,7 @@
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/of.h>
++#include <linux/panic_notifier.h>
+ #include <linux/pid.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm.h>
+@@ -65,6 +66,7 @@
+ #define DW_WDT_REC_COUNT_OFF	0x4
+ #define DW_WDT_REC_TEXT_OFF	0x8
+ #define DW_WDT_REC_TEXT		"linux wdt timeout\n"
++#define DW_WDT_REC_PANIC	"linux panic\n"
+ 
+ static const u32 dw_wdt_fix_tops[DW_WDT_NUM_TOPS] = {
+ 	DW_WDT_FIX_TOP(0), DW_WDT_FIX_TOP(1), DW_WDT_FIX_TOP(2),
+@@ -111,6 +113,7 @@ struct dw_wdt {
+ 	spinlock_t		sig_lock;
+ 	struct pid		*sig_pid;
+ 	void __iomem		*rec;
++	struct notifier_block	panic_nb;
+ };
+ 
+ #define to_dw_wdt(wdd)	container_of(wdd, struct dw_wdt, wdd)
+@@ -151,15 +154,43 @@ static void dw_wdt_signal_pretimeout(struct dw_wdt *dw_wdt)
+ 	}
+ }
+ 
+-static void dw_wdt_rec_write(struct dw_wdt *dw_wdt)
++static void dw_wdt_rec_write(struct dw_wdt *dw_wdt, const char *text,
++			     size_t len)
+ {
+-	static const char text[] = DW_WDT_REC_TEXT;
+-
+-	memcpy_toio(dw_wdt->rec + DW_WDT_REC_TEXT_OFF, text, sizeof(text));
+-	writel(sizeof(text) - 1, dw_wdt->rec + DW_WDT_REC_COUNT_OFF);
++	memcpy_toio(dw_wdt->rec + DW_WDT_REC_TEXT_OFF, text, len + 1);
++	writel(len, dw_wdt->rec + DW_WDT_REC_COUNT_OFF);
+ 	writel(DW_WDT_REC_MAGIC, dw_wdt->rec + DW_WDT_REC_MAGIC_OFF);
+ }
+ 
++static int dw_wdt_panic_notify(struct notifier_block *nb, unsigned long event,
++			       void *data)
++{
++	struct dw_wdt *dw_wdt = container_of(nb, struct dw_wdt, panic_nb);
++
++	dw_wdt_rec_write(dw_wdt, DW_WDT_REC_PANIC,
++			 sizeof(DW_WDT_REC_PANIC) - 1);
++	return NOTIFY_DONE;
++}
++
++static void dw_wdt_panic_unregister(void *data)
++{
++	struct dw_wdt *dw_wdt = data;
++
++	atomic_notifier_chain_unregister(&panic_notifier_list,
++					 &dw_wdt->panic_nb);
++}
++
++/* Whether the record holds the panic text rather than the pre-timeout one. */
++static bool dw_wdt_rec_is_panic(void __iomem *rec, u32 count)
++{
++	char text[sizeof(DW_WDT_REC_PANIC) - 1];
++
++	if (count != sizeof(text))
++		return false;
++	memcpy_fromio(text, rec + DW_WDT_REC_TEXT_OFF, sizeof(text));
++	return !memcmp(text, DW_WDT_REC_PANIC, sizeof(text));
++}
++
+ static void dw_wdt_rec_init(struct platform_device *pdev, struct dw_wdt *dw_wdt)
+ {
+ 	struct resource *res;
+@@ -186,11 +217,18 @@ static void dw_wdt_rec_init(struct platform_device *pdev, struct dw_wdt *dw_wdt)
+ 	count = readl(rec + DW_WDT_REC_COUNT_OFF);
+ 	if (readl(rec + DW_WDT_REC_MAGIC_OFF) == DW_WDT_REC_MAGIC && count &&
+ 	    count <= resource_size(res) - DW_WDT_REC_TEXT_OFF)
+-		dw_wdt->wdd.bootstatus |= WDIOF_CARDRESET;
++		dw_wdt->wdd.bootstatus |= dw_wdt_rec_is_panic(rec, count) ?
++					  WDIOF_EXTERN1 : WDIOF_CARDRESET;
+ 
+ 	writel(0, rec + DW_WDT_REC_MAGIC_OFF);
+ 	writel(0, rec + DW_WDT_REC_COUNT_OFF);
+ 	dw_wdt->rec = rec;
++
++	dw_wdt->panic_nb.notifier_call = dw_wdt_panic_notify;
++	atomic_notifier_chain_register(&panic_notifier_list, &dw_wdt->panic_nb);
++	if (devm_add_action_or_reset(&pdev->dev, dw_wdt_panic_unregister,
++				     dw_wdt))
++		dev_warn(&pdev->dev, "kernel panic not recorded\n");
+ }
+ 
+ static void dw_wdt_update_mode(struct dw_wdt *dw_wdt, enum dw_wdt_rmod rmod)
+@@ -471,7 +509,8 @@ static irqreturn_t dw_wdt_irq(int irq, void *devid)
+ 	th1520_event_set_rebootmode(TH1520_EVENT_SW_WATCHDOG);
+ 
+ 	if (dw_wdt->rec)
+-		dw_wdt_rec_write(dw_wdt);
++		dw_wdt_rec_write(dw_wdt, DW_WDT_REC_TEXT,
++				 sizeof(DW_WDT_REC_TEXT) - 1);
+ 	dw_wdt_signal_pretimeout(dw_wdt);
+ 	/*
+ 	 * Drop back to reset response mode before acknowledging, so the next
+-- 
+2.43.0
+

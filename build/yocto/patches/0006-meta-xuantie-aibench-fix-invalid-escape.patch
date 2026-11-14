@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] meta-xuantie: aibench: fix an invalid escape sequence
+
+Modified by Canaan Creative Co., Ltd.
+
+Upstream-Status: Pending
+
+--- a/recipes-benchmark/aibench/aibench.bb
++++ b/recipes-benchmark/aibench/aibench.bb
+@@ -90,7 +90,7 @@
+ 
+             package = "aibench-{}-{}-{}".format(cpu2, quant_name.lower().replace('_', '-'), model.lower().replace('_', '-'))
+             package_sen += package
+-            package_sen += " \ \n"
++            package_sen += " \\ \n"
+             FILE_name = "FILES:{}".format(package)
+             #bb.plain("{} = {}".format(FILE_name, "\"aibench/{}/{}/{}/*\"".format(cpu.split("/")[2], quant_name, model)));
+             os.system("cp {} {}".format(os.path.join(model_path,"*.bin"), out_path))

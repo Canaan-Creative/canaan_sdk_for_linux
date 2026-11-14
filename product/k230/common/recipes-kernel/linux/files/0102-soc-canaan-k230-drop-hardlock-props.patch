@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] soc: canaan: k230: drop the unused hardlock properties
+
+k230_pd_probe() reads three "hardlock" cells into variables that nothing
+uses. Remove the variables and the reads.
+
+Upstream-Status: Pending
+---
+ drivers/soc/canaan/k230-power-domains.c | 9 ---------
+ 1 file changed, 9 deletions(-)
+
+diff --git a/drivers/soc/canaan/k230-power-domains.c b/drivers/soc/canaan/k230-power-domains.c
+index 5ca7cc1c7..22b79ae74 100644
+--- a/drivers/soc/canaan/k230-power-domains.c
++++ b/drivers/soc/canaan/k230-power-domains.c
+@@ -43,9 +43,6 @@ struct k230_pm_domain {
+ #define PM_PWR_REPAIR_STAT(pd) ((pd)->reg_offset[REG_PM_REPAIR_STAT])
+ 
+ static void __iomem *sysctl_power_base;
+-static u32 hardlock_disp;
+-static u32 hardlock_disp_cpu0;
+-static u32 hardlock_disp_cpu1;
+ 
+ static int k230_power_on(struct generic_pm_domain *domain)
+ {
+@@ -176,12 +173,6 @@ int k230_pd_probe(struct platform_device *pdev,
+ 
+ 	of_genpd_add_provider_onecell(pdev->dev.of_node, genpd_data);
+ 
+-	of_property_read_u32_index(pdev->dev.of_node, "hardlock", 0,
+-				   &hardlock_disp);
+-	of_property_read_u32_index(pdev->dev.of_node, "hardlock", 1,
+-				   &hardlock_disp_cpu0);
+-	of_property_read_u32_index(pdev->dev.of_node, "hardlock", 2,
+-				   &hardlock_disp_cpu1);
+ 
+ 	dev_info(&pdev->dev, "powerdomain init ok\n");
+ 
+-- 
+2.43.0
+

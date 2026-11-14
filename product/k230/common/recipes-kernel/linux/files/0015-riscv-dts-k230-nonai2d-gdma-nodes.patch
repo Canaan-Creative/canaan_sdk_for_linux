@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: add the nonai2d and gdma nodes
+
+Describe the non-AI 2D engine at 0x8080c000 and the GDMA controller at
+0x80800000, both in the VPU power domain.
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/k230.dtsi | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+index ecbbd5d1c..a49a9820e 100644
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -620,6 +620,22 @@ vpu: vpu@0x90400000 {
+ 			clock-names         = "vpu";
+ 		};
+ 
++		nonai2d: nonai2d@8080c000 {
++			status = "okay";
++			compatible = "canaan,nonai-2d";
++			reg = <0x0 0x8080c000 0x0 0x1000>;
++			interrupts = <141 IRQ_TYPE_LEVEL_HIGH>;
++			power-domains = <&sysctl_power K230_PM_DOMAIN_VPU>;
++		};
++
++		gdma: gdma@0x80800000 {
++			status = "okay";
++			compatible = "canaan,gdma";
++			reg = <0x0 0x80800000 0x0 0x1000>;
++			interrupts = <140 IRQ_TYPE_LEVEL_HIGH>;
++			power-domains = <&sysctl_power K230_PM_DOMAIN_VPU>;
++		};
++
+ 		pdma: pdma@0x80804000 {
+ 			#dma-cells          = <4>;
+ 			dma-channels        = <8>;
+-- 
+2.43.0
+

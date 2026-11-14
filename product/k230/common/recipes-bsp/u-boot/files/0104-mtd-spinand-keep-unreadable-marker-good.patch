@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] mtd: spinand: do not report a block bad when its marker
+ cannot be read
+
+spinand_isbad() ignores the return codes of spinand_select_target() and
+spinand_read_page(). The marker buffer is zero-initialised, so a failed
+read leaves { 0x00, 0x00 } and the block is reported bad, and
+nanddev_isbad() caches that result in the BBT until the next reset.
+spinand_isbad() also leaves the on-die ECC in whatever state the
+previous page access set, because in this driver the caller enables or
+disables it per page.
+
+Check both return codes, and disable the on-die ECC before the raw
+marker read.
+
+A marker that cannot be read is reported good and logged. nand_ops
+isbad returns bool, so the error cannot be passed up without changing
+that interface. A block wrongly reported bad is dropped silently and
+the result is cached, while every consumer of a good block has its own
+error path: ECC status on read, program status on write and the image
+check in the K230 loader.
+
+Upstream-Status: Pending
+---
+ drivers/mtd/nand/spi/core.c | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mtd/nand/spi/core.c b/drivers/mtd/nand/spi/core.c
+index 3a1e7e18..3db5daf5 100644
+--- a/drivers/mtd/nand/spi/core.c
++++ b/drivers/mtd/nand/spi/core.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Copyright (C) 2016-2017 Micron Technology, Inc.
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
+  *
+  * Authors:
+  *	Peter Pan <peterpandong@micron.com>
+@@ -681,13 +682,30 @@ static bool spinand_isbad(struct nand_device *nand, const struct nand_pos *pos)
+ 		.oobbuf.in = marker,
+ 		.mode = MTD_OPS_RAW,
+ 	};
++	int ret;
++
++	ret = spinand_select_target(spinand, pos->target);
++	if (ret)
++		goto unreadable;
++
++	ret = spinand_ecc_enable(spinand, false);
++	if (ret)
++		goto unreadable;
++
++	ret = spinand_read_page(spinand, &req, false);
++	if (ret)
++		goto unreadable;
+ 
+-	spinand_select_target(spinand, pos->target);
+-	spinand_read_page(spinand, &req, false);
+ 	if (marker[0] != 0xff || marker[1] != 0xff)
+ 		return true;
+ 
+ 	return false;
++
++unreadable:
++	dev_err(spinand->slave->dev,
++		"bad block marker unreadable (%d) at target %u lun %u block %u, assuming good\n",
++		ret, pos->target, pos->lun, pos->eraseblock);
++	return false;
+ }
+ 
+ static int spinand_mtd_block_isbad(struct mtd_info *mtd, loff_t offs)
+-- 
+2.43.0
+

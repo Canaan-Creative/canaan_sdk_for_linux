@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] mtd: spinand: gigadevice: add gd5f4gm8uexxg and gd5f4gm8rexxg
+
+Add the GigaDevice GD5F4GM8UExxG and GD5F4GM8RExxG 4 Gbit SPI-NAND
+parts. Their quad I/O cache read needs two dummy bytes, so they get
+their own read variants; QE and ECC handling match GD5F1GQ4UExxG.
+
+Upstream-Status: Pending
+---
+ drivers/mtd/nand/spi/gigadevice.c | 34 +++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/drivers/mtd/nand/spi/gigadevice.c b/drivers/mtd/nand/spi/gigadevice.c
+index f2ecf47f..47305a4a 100644
+--- a/drivers/mtd/nand/spi/gigadevice.c
++++ b/drivers/mtd/nand/spi/gigadevice.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+  * Copyright (C) 2018 Stefan Roese <sr@denx.de>
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
+  *
+  * Derived from drivers/mtd/nand/spi/micron.c
+  *   Copyright (c) 2016-2017 Micron Technology, Inc.
+@@ -43,6 +44,15 @@ static SPINAND_OP_VARIANTS(read_cache_variants_f,
+ 		SPINAND_PAGE_READ_FROM_CACHE_OP_3A(true, 0, 1, NULL, 0),
+ 		SPINAND_PAGE_READ_FROM_CACHE_OP_3A(false, 0, 0, NULL, 0));
+ 
++/* GD5F1GQ5/4GM8 series — QUADIO needs 2 dummy bytes, the rest 1. */
++static SPINAND_OP_VARIANTS(read_cache_variants_1gq5,
++		SPINAND_PAGE_READ_FROM_CACHE_QUADIO_OP(0, 2, NULL, 0),
++		SPINAND_PAGE_READ_FROM_CACHE_X4_OP(0, 1, NULL, 0),
++		SPINAND_PAGE_READ_FROM_CACHE_DUALIO_OP(0, 1, NULL, 0),
++		SPINAND_PAGE_READ_FROM_CACHE_X2_OP(0, 1, NULL, 0),
++		SPINAND_PAGE_READ_FROM_CACHE_OP(true, 0, 1, NULL, 0),
++		SPINAND_PAGE_READ_FROM_CACHE_OP(false, 0, 1, NULL, 0));
++
+ static SPINAND_OP_VARIANTS(write_cache_variants,
+ 		SPINAND_PROG_LOAD_X4(true, 0, NULL, 0),
+ 		SPINAND_PROG_LOAD(true, 0, NULL, 0));
+@@ -349,6 +359,30 @@ static const struct spinand_info gigadevice_spinand_table[] = {
+ 		     SPINAND_HAS_QE_BIT,
+ 		     SPINAND_ECCINFO(&gd5fxgqx_variant2_ooblayout,
+ 				     gd5fxgq5xexxg_ecc_get_status)),
++	/*
++	 * GD5F4GM8UExxG / GD5F4GM8RExxG: raw ID c8 95 (UExxG) / c8 85 (RExxG),
++	 * read with OPCODE+DUMMY. Same QE/ECC handling as GD5F1GQ4UExxG.
++	 */
++	SPINAND_INFO("GD5F4GM8UExxG",
++		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_DUMMY, 0x95),
++		     NAND_MEMORG(1, 2048, 128, 64, 4096, 80, 1, 1, 1),
++		     NAND_ECCREQ(8, 512),
++		     SPINAND_INFO_OP_VARIANTS(&read_cache_variants_1gq5,
++					      &write_cache_variants,
++					      &update_cache_variants),
++		     SPINAND_HAS_QE_BIT,
++		     SPINAND_ECCINFO(&gd5fxgqx_variant2_ooblayout,
++				     gd5fxgq4uexxg_ecc_get_status)),
++	SPINAND_INFO("GD5F4GM8RExxG",
++		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_DUMMY, 0x85),
++		     NAND_MEMORG(1, 2048, 128, 64, 4096, 80, 1, 1, 1),
++		     NAND_ECCREQ(8, 512),
++		     SPINAND_INFO_OP_VARIANTS(&read_cache_variants_1gq5,
++					      &write_cache_variants,
++					      &update_cache_variants),
++		     SPINAND_HAS_QE_BIT,
++		     SPINAND_ECCINFO(&gd5fxgqx_variant2_ooblayout,
++				     gd5fxgq4uexxg_ecc_get_status)),
+ };
+ 
+ static const struct spinand_manufacturer_ops gigadevice_spinand_manuf_ops = {
+-- 
+2.43.0
+

@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: add the ai clocks to gnne and ai2d
+
+Describe ai_clk, the KPU core clock selectable between pll0_div2 and
+pll3_div2 with a 1..8 divider, and ai_aclk, its bus clock gate. Give
+both clocks and the AI power domain to the gnne and ai2d nodes, whose
+drivers enable their power and clocks themselves.
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/k230.dtsi          |  6 +++
+ .../boot/dts/canaan/k230_clock_provider.dtsi  | 47 +++++++++++++++++++
+ 2 files changed, 53 insertions(+)
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+index f414f721c..ecbbd5d1c 100644
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -799,6 +799,9 @@ gnne: gnne@80400000 {
+ 			compatible = "k230-gnne";
+ 			reg = <0x0 0x80400000 0x0 0x00000800>;
+ 			interrupts = <189 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ai_clk>, <&ai_aclk>;
++			clock-names = "ai_clk", "ai_aclk";
++			power-domains = <&sysctl_power K230_PM_DOMAIN_AI>;
+ 		};
+ 
+ 		ai2d: ai2d@80400c00 {
+@@ -806,6 +809,9 @@ ai2d: ai2d@80400c00 {
+ 			compatible = "k230-ai2d";
+ 			reg = <0x0 0x80400c00 0x0 0x00000400>;
+ 			interrupts = <191 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ai_clk>, <&ai_aclk>;
++			clock-names = "ai_clk", "ai_aclk";
++			power-domains = <&sysctl_power K230_PM_DOMAIN_AI>;
+ 		};
+ 
+ 		tsensor: tsensor@91107000 {
+diff --git a/arch/riscv/boot/dts/canaan/k230_clock_provider.dtsi b/arch/riscv/boot/dts/canaan/k230_clock_provider.dtsi
+index 83a8d0abd..39fcbfad7 100644
+--- a/arch/riscv/boot/dts/canaan/k230_clock_provider.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230_clock_provider.dtsi
+@@ -2565,6 +2565,53 @@ timer5_clk: timer5_clk {
+ 	 *	3. nonai2d_aclk_gate: nonai2d axi clk gate;
+ 	 *	4. pdma_aclk_gate: peri dma axi clk gate;
+ 	 */
++	/* ai_CLK_CFG: mux, gate and rate */
++	ai_clk: ai_clk {
++		#clock-cells = <0>;
++		compatible = "canaan,k230-clk-composite";
++		status = "okay";
++		read-only = <0>;
++
++		/* parents */
++		clocks = <&pll0_div2>, <&pll3_div2>;
++		clk-parent-reg-offset = <0x08>;
++		clk-parent-reg-value-shift = <0x2>;
++		clk-parent-reg-value-mask = <0x1>;
++
++		/* gate */
++		clk-gate-reg-offset = <0x8>;
++		clk-gate-reg-bit-enable = <0>;
++		clk-gate-reg-bit-reverse = <0>;
++
++		/* rate */
++		clk-rate-conf-mul-min = <1>;
++		clk-rate-conf-mul-max = <1>;
++		clk-rate-conf-div-min = <1>;
++		clk-rate-conf-div-max = <8>;
++		clk-rate-calc-method = <1>;
++
++		clk-rate-reg-offset = <0x8>;
++		clk-rate-reg-mul-value-shift = <0>;
++		clk-rate-reg-mul-value-mask = <0>;
++
++		clk-rate-reg-div-value-shift = <3>;
++		clk-rate-reg-div-value-mask = <0x7>;
++		clk-rate-reg-write-enable-bit = <31>;
++	};
++
++	ai_aclk: ai_aclk {
++		#clock-cells = <0>;
++		compatible = "canaan,k230-clk-composite";
++		clocks = <&pll0_div4>;
++		status = "okay";
++		read-only = <0>;
++
++		/* gate */
++		clk-gate-reg-offset = <0x8>;
++		clk-gate-reg-bit-enable = <10>;
++		clk-gate-reg-bit-reverse = <0>;
++	};
++
+ 	shrm_src: shrm_src {
+ 		#clock-cells							= <0>;
+ 		compatible		= "canaan,k230-clk-composite";
+-- 
+2.43.0
+

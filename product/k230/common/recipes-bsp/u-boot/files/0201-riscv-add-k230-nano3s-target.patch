@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] board: canaan: k230_nano3s: add the target to the riscv build
+
+Add TARGET_K230_NANO3S, source the board Kconfig and build
+k230-nano3s.dtb.
+
+Upstream-Status: Pending
+---
+ arch/riscv/Kconfig      | 4 ++++
+ arch/riscv/dts/Makefile | 1 +
+ 2 files changed, 5 insertions(+)
+
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index 5c107a25..566fdf32 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -17,6 +17,9 @@ config TARGET_BANANAPI_F3
+ config TARGET_K230_CANMV
+ 	bool "Support K230 CanMV Board"
+ 
++config TARGET_K230_NANO3S
++	bool "Support K230 Avalon Nano3s Board"
++
+ config TARGET_LICHEERV_NANO
+ 	bool "Support LicheeRV Nano Board"
+ 
+@@ -103,6 +106,7 @@ config SPL_ZERO_MEM_BEFORE_USE
+ source "board/andestech/ae350/Kconfig"
+ source "board/aspeed/ibex_ast2700/Kconfig"
+ source "board/canaan/k230_canmv/Kconfig"
++source "board/canaan/k230_nano3s/Kconfig"
+ source "board/canaan/common/Kconfig"
+ source "board/emulation/qemu-riscv/Kconfig"
+ source "board/microchip/mpfs_icicle/Kconfig"
+diff --git a/arch/riscv/dts/Makefile b/arch/riscv/dts/Makefile
+index cf1872f3..ea5dca80 100644
+--- a/arch/riscv/dts/Makefile
++++ b/arch/riscv/dts/Makefile
+@@ -3,6 +3,7 @@
+ dtb-$(CONFIG_TARGET_ANDES_AE350) += ae350_32.dtb ae350_64.dtb
+ dtb-$(CONFIG_TARGET_BANANAPI_F3) += k1-bananapi-f3.dtb
+ dtb-$(CONFIG_TARGET_K230_CANMV) += k230-canmv.dtb
++dtb-$(CONFIG_TARGET_K230_NANO3S) += k230-nano3s.dtb
+ dtb-$(CONFIG_TARGET_MICROCHIP_ICICLE) += mpfs-icicle-kit.dtb
+ dtb-$(CONFIG_TARGET_MILKV_DUO) += cv1800b-milkv-duo.dtb
+ dtb-$(CONFIG_TARGET_LICHEERV_NANO) += sg2002-licheerv-nano-b.dtb
+-- 
+2.43.0
+

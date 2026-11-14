@@ -1,0 +1,5 @@
+# Build context is only docker/ — the toolchain stage fetches from the network,
+# nothing else from the repo is needed. Exclude everything but this dir's files.
+*
+!Dockerfile
+!entrypoint.sh

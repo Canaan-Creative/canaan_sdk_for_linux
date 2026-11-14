@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: sparsemem: limit MAX_PHYSMEM_BITS to 32
+
+K230 physical addresses fit in 32 bits. With the 64-bit
+default of 56 bits, SPARSEMEM_EXTREME allocates a 16 MiB section root
+array at boot, which does not fit in the 128 MiB of SiP DDR. Set
+MAX_PHYSMEM_BITS to 32 so the array stays small.
+
+Upstream-Status: Pending
+---
+ arch/riscv/include/asm/sparsemem.h | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/arch/riscv/include/asm/sparsemem.h b/arch/riscv/include/asm/sparsemem.h
+index 63acaecc3..e74d21912 100644
+--- a/arch/riscv/include/asm/sparsemem.h
++++ b/arch/riscv/include/asm/sparsemem.h
+@@ -4,11 +4,12 @@
+ #define _ASM_RISCV_SPARSEMEM_H
+ 
+ #ifdef CONFIG_SPARSEMEM
+-#ifdef CONFIG_64BIT
+-#define MAX_PHYSMEM_BITS	56
+-#else
+-#define MAX_PHYSMEM_BITS	34
+-#endif /* CONFIG_64BIT */
++/*
++ * K230 family physical addresses fit in 32 bits. With 56 bits,
++ * SPARSEMEM_EXTREME allocates a 16 MiB section root array, which does
++ * not fit in the 128 MiB of SiP DDR; with 32 bits it takes 8 bytes.
++ */
++#define MAX_PHYSMEM_BITS	32
+ #define SECTION_SIZE_BITS	27
+ #endif /* CONFIG_SPARSEMEM */
+ 
+-- 
+2.43.0
+

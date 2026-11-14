@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] meta-xuantie: toolchain-init: skip a read-only toolchain config
+
+Modified by Canaan Creative Co., Ltd.
+
+Upstream-Status: Pending
+
+--- a/conf/distro/include/xuantie-toolchain-init.sh
++++ b/conf/distro/include/xuantie-toolchain-init.sh
+@@ -55,8 +55,10 @@
+     mkdir -p "$DOWNLOAD_DIR"
+     mkdir -p "$TOOLCHAIN_DIR"
+ 
+-    # Rename old config file
+-    if [ -f "$CONFIG_FILE" ]; then
++    # Rename old config file. Skip clobbering a read-only, already-provisioned
++    # tree (e.g. the baked Docker toolchain symlinked in); its .config is
++    # authoritative. Still stub a fresh/writable dir so native checkouts download.
++    if [ -f "$CONFIG_FILE" ] && { [ -w "$TOOLCHAIN_DIR" ] || [ ! -e "$HIDDEN_CONFIG" ]; }; then
+         cp "$CONFIG_FILE" "$HIDDEN_CONFIG"
+     fi
+ 
+@@ -196,10 +198,14 @@
+     # Skip if config file doesn't exist (muslc is optional)
+     [ ! -f "$CONFIG_FILE" ] && continue
+ 
+-    # Setup environment
++    # Setup environment. Skip clobbering a read-only, already-provisioned tree
++    # (baked Docker toolchain); its .config is authoritative. Still stub a
++    # fresh/writable dir so native checkouts download.
+     mkdir -p "$DOWNLOAD_DIR"
+     mkdir -p "$TOOLCHAIN_DIR"
+-    cp "$CONFIG_FILE" "$HIDDEN_CONFIG"
++    if [ -w "$TOOLCHAIN_DIR" ] || [ ! -e "$HIDDEN_CONFIG" ]; then
++        cp "$CONFIG_FILE" "$HIDDEN_CONFIG"
++    fi
+ 
+     # Source configuration
+     source "$HIDDEN_CONFIG"

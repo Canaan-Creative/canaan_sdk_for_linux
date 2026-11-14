@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] drivers: build the canaan hardlock driver
+
+Source drivers/canaan-hardlock/Kconfig and descend into
+drivers/canaan-hardlock/ when CANAAN_HARDLOCK is set.
+
+Upstream-Status: Pending
+---
+ drivers/Kconfig  | 1 +
+ drivers/Makefile | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index 1c32eca2c..a0aac3188 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -246,5 +246,6 @@ source "drivers/cdx/Kconfig"
+ source "drivers/canaan-hwtimer/Kconfig"
+ 
+ source "drivers/canaan-ws2812/Kconfig"
++source "drivers/canaan-hardlock/Kconfig"
+ 
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 0cdd218f3..6026fcd3d 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -201,3 +201,4 @@ obj-$(CONFIG_CANAAN_HWTIMER)	+= canaan-hwtimer/
+ 
+ obj-$(CONFIG_S390)		+= s390/
+ obj-$(CONFIG_CANAAN_I2S_WS2812)	+= canaan-ws2812/
++obj-$(CONFIG_CANAAN_HARDLOCK)	+= canaan-hardlock/
+-- 
+2.43.0
+

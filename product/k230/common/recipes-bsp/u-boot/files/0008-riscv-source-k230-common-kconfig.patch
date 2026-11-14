@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: source the k230 common board kconfig
+
+Source board/canaan/common/Kconfig so that the options of the shared
+K230 board code are available to every K230 board.
+
+Upstream-Status: Pending
+---
+ arch/riscv/Kconfig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index 8c6feae5..5c107a25 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -103,6 +103,7 @@ config SPL_ZERO_MEM_BEFORE_USE
+ source "board/andestech/ae350/Kconfig"
+ source "board/aspeed/ibex_ast2700/Kconfig"
+ source "board/canaan/k230_canmv/Kconfig"
++source "board/canaan/common/Kconfig"
+ source "board/emulation/qemu-riscv/Kconfig"
+ source "board/microchip/mpfs_icicle/Kconfig"
+ source "board/openpiton/riscv64/Kconfig"
+-- 
+2.43.0
+

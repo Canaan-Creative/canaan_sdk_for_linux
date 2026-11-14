@@ -1,0 +1,461 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: add the avalon nano3s board
+
+Add the device tree of the Avalon Nano3s, a K230 miner board with
+128 MiB of SiP DDR:
+
+ - console on UART1 (ttyS1), the ASIC link on UART3 with TX through the
+   peripheral DMA controller (PDMA request line 6) and RX by PIO
+ - SPI-NAND W25N02KW on spi0 with the A/B MTD partition layout, on the
+   enhanced DW-SSI driver
+ - ST7789V SPI TFT on spi2 through fbtft, keeping the boot logo
+ - I2C2 and I2C3, USB0, RTC, the WS2812 LED on I2S0 with PDMA, the
+   hardware spinlock block, gpio-keys on pins 0 and 28 and a
+   pwm-beeper on PWM channel 2
+ - the PMU power key, counted in 32768 Hz ticks: force power-down
+   after 320000, power event after 98304, debounce 256
+ - the per-pin GPIOs the board uses, with gpio0 enabled so that the
+   GPIO numbering starts at 0
+ - the watchdog with the reset record region at 0x80100000
+ - the display, GPU and video output blocks disabled
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/k230-nano3s.dts | 424 +++++++++++++++++++++
+ 1 file changed, 424 insertions(+)
+ create mode 100644 arch/riscv/boot/dts/canaan/k230-nano3s.dts
+
+diff --git a/arch/riscv/boot/dts/canaan/k230-nano3s.dts b/arch/riscv/boot/dts/canaan/k230-nano3s.dts
+new file mode 100644
+index 000000000..af1c3d085
+--- /dev/null
++++ b/arch/riscv/boot/dts/canaan/k230-nano3s.dts
+@@ -0,0 +1,424 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++/*
++ * Avalon Nano3s — Canaan K230 SPI-NAND miner board, 128 MiB SiP DDR.
++ *
++ * Console is UART1 (ttyS1) on IO3/IO4. spi0 partition layout MUST stay
++ * byte-aligned with scripts/genimage-spinand.cfg and aup-ota.json.
++ */
++
++#include "k230.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++
++/*
++ * Canaan K230 shared memory layout: full DRAM from 0x0. Miners omit
++ * K230_MEDIA_CMA_SIZE, so no media CMA pool is reserved. OpenSBI's
++ * firmware reservation (mmode_resv) is injected no-map by firmware.
++ */
++#define K230_DRAM_TOP 0x7ffe000
++#include "k230-canaan-mem.dtsi"
++
++/ {
++	model = "Avalon Nano3s (K230)";
++	compatible = "canaan,k230d-nano3s", "canaan,k230";
++
++	aliases {
++		serial1 = &uart1;
++		serial3 = &uart3;
++		i2c2 = &i2c2;
++		i2c3 = &i2c3;
++	};
++
++	chosen {
++		/*
++		 * Console UART1/ttyS1. U-Boot board.c fdt_chosen_bootargs
++		 * overrides this at boot; it applies to direct/standalone
++		 * boots. rootfs = rootfs_a = mtd10.
++		 */
++		bootargs = "console=ttyS1,115200 earlycon root=ubi0:ubi_rootfs_part rootfstype=ubifs rw rootwait ubi.mtd=10";
++	};
++
++	/*
++	 * Dedicated 96 MHz baud reference for uart3 (ASIC UART), decoupled from
++	 * the shared apb_clk (48 MHz) that clocks the uart1 console. A plain
++	 * fixed-clock so dw8250 cannot re-rate it (same rationale as apb_clk).
++	 * 96 MHz lets the 8250 reach the 4.8 Mbps ASIC baud (DLL=1 + DLF=4 =
++	 * 96e6/(16*1.25)); 48 MHz tops out at 3 Mbps. The matching hardware /1
++	 * divider is set by U-Boot board_init.
++	 */
++	uart3_clk96: uart3-clk96 {
++		compatible = "fixed-clock";
++		clock-frequency = <96000000>;
++		clock-output-names = "uart3_clk96";
++		#clock-cells = <0>;
++	};
++
++	/*
++	 * Input devices, interrupt-driven:
++	 *   - gpio-keys  : keys on GPIO pin 0 (105) / pin 28 (103), per-pin &portN.
++	 *   - pwm-beeper : buzzer on PWM ch2, NORMAL polarity (k230 pwm defaults normal).
++	 * evdev exposes both as /dev/input/eventN.
++	 */
++	gpio_key: gpio-keys {
++		compatible = "gpio-keys";
++
++		func_key0 {
++			label = "gpio-key-0";
++			linux,code = <105>;
++			gpios = <&port0 0 GPIO_ACTIVE_LOW>;
++			debounce-interval = <3>;
++		};
++
++		func_key1 {
++			label = "gpio-key-28";
++			linux,code = <103>;
++			gpios = <&port28 0 GPIO_ACTIVE_LOW>;
++			debounce-interval = <3>;
++		};
++	};
++
++	beep: beep {
++		compatible = "pwm-beeper";
++		beeper-hz = <8000>;
++		pwms = <&pwm0_2 2 5000000 0>;	/* 0 = PWM_POLARITY_NORMAL */
++		status = "okay";
++	};
++};
++
++/*
++ * apb_clk is the 8250 baud divisor reference of the console (uart1). It is
++ * a fixed-clock, so dw8250 cannot re-rate it; a CCF clock is re-rated per
++ * baud by clk_set_rate. 48 MHz = pll0_div16/2, the per-UART core-clock
++ * default.
++ */
++&apb_clk {
++	clock-frequency = <48000000>;
++};
++
++/*
++ * MIPI DSI display stack (display, dsi, gpu, vo) disabled; the LCD is on
++ * spi2.
++ */
++&display {
++	status = "disabled";
++};
++
++&dsi {
++	status = "disabled";
++};
++
++/*
++ * GPIO pins used by Nano3s, enabled per-pin, plus gpio31 (RI_HASH).
++ *
++ * Per-pin model: gpio_provider.dtsi gives one gpiochip per pin with
++ * base = id = global pin number; the miner exports pins by flat 0-63
++ * number via /sys/class/gpio (gpio_dev.c = lowest gpiochip base + P).
++ * gpio0 stays enabled so it anchors base 0 and pin P -> gpioP. Only the
++ * pins the board actually uses are enabled:
++ *   0  KEY        10 ALERT_MONITOR  11/12 I2C2   25 PWM_BL
++ *   28 KEY        29 PGOOD          30 INT_PD    31 RI_HASH
++ *   34 EN_HASH    36/37 I2C3/HASH   41 DC_LCD    44 RST_LCD
++ */
++&gpio0 {
++	status = "okay";
++};
++
++&gpio10 {
++	status = "okay";
++};
++
++&gpio11 {
++	status = "okay";
++};
++
++&gpio12 {
++	status = "okay";
++};
++
++&gpio25 {
++	status = "okay";
++};
++
++&gpio28 {
++	status = "okay";
++};
++
++&gpio29 {
++	status = "okay";
++};
++
++&gpio30 {
++	status = "okay";
++};
++
++&gpio31 {
++	status = "okay";
++};
++
++&gpio34 {
++	status = "okay";
++};
++
++&gpio36 {
++	status = "okay";
++};
++
++&gpio37 {
++	status = "okay";
++};
++
++&gpio41 {
++	status = "okay";
++};
++
++&gpio44 {
++	status = "okay";
++};
++
++&gpu {
++	status = "disabled";
++};
++
++/* HASH-string / PD / sensor I2Cs: i2c2 + i2c3. */
++&i2c2 {
++	/* high 10us + low 10us -> ~50kHz SCL */
++	clock-frequency = <100000>;
++	ss-hcnt-ns = <10000>;
++	ss-lcnt-ns = <10000>;
++	i2c-sda-hold-time-ns = <2000>;
++	/* bus-recovery: GPIO 12/11 (per-pin port12/port11) */
++	sda-gpios = <&port12 0 GPIO_ACTIVE_HIGH>;
++	scl-gpios = <&port11 0 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
++	pinctrl-names = "default", "gpio";
++	pinctrl-0 = <&i2c2_pins>;
++	pinctrl-1 = <&i2c2_recovery_pins>;
++	status = "okay";
++};
++
++&i2c3 {
++	/* high 10us + low 10us -> ~50kHz SCL (matches i2c2) */
++	clock-frequency = <100000>;
++	ss-hcnt-ns = <10000>;
++	ss-lcnt-ns = <10000>;
++	i2c-sda-hold-time-ns = <2000>;
++	status = "okay";
++};
++
++/* ws2812 owns I2S0. */
++&i2s {
++	status = "disabled";
++};
++
++/*
++ * I2C2 pin states for DesignWare controller bus recovery.
++ *
++ * The IO11/IO12 pads are muxed to I2C2 by U-Boot board_init(), and the
++ * kernel inherits them, so I2C2 works with no kernel pinctrl-0. The designware
++ * driver still requests a pinctrl handle so it can flip the pads to GPIO for a
++ * bus-recovery pulse and back; without these states it logs "getting pinctrl
++ * info failed: bus recovery might not work". i2c-core selects "default" (I2C)
++ * then "gpio" (bit-bang) then "default" during recovery.
++ */
++&iomux {
++	i2c2_pins: i2c2_pins {
++		pins = K230_IO11, K230_IO12;
++		function = "alt3";	/* K230_IO11_I2C2_SCL / K230_IO12_I2C2_SDA */
++	};
++
++	i2c2_recovery_pins: i2c2_recovery_pins {
++		pins = K230_IO11, K230_IO12;
++		function = "alt0";	/* GPIO: K230_IO11_GPIO11 / K230_IO12_GPIO12 */
++	};
++};
++
++/* The ws2812 driver needs I2S TX DMA (no PIO path), so pdma is enabled. */
++&pdma {
++	status = "okay";
++};
++
++&pmu {
++	status = "okay";
++
++	int0 {
++		force-powerdown-value = <320000>;
++		power-event-value = <98304>;
++		debounce-value = <256>;
++	};
++};
++
++&pwm0_2 {
++	#pwm-cells = <3>;
++	status = "okay";
++};
++
++&rtc {
++	status = "okay";
++};
++
++/*
++ * QSPI @ 0x91584000 — SPI-NAND boot flash. Partition table mirrors
++ * aup-ota.json and scripts/genimage-spinand.cfg one-for-one, except
++ * all_flash, which spans the first 256 MiB read-only; mtd indices drive
++ * bootargs (ubi.mtd=10 -> rootfs_a). The partitions are mtd0
++ * (uboot_spl_a) to mtd15 (all_flash) in list order; rootfs_a (mtd10) is
++ * a 48 MiB UBI partition.
++ */
++&spi0 {
++	status = "okay";
++	/*
++	 * Bind the enhanced DW-SSI driver: correct SPI-NAND raw-OOB
++	 * (bad-block marker) + quad reads, which the generic
++	 * canaan,k230-spi controller mis-handles on this board.
++	 */
++	compatible = "snps,dwc-ssi-1.01a-k230";
++	interrupts = <146 IRQ_TYPE_LEVEL_HIGH>, <148 IRQ_TYPE_LEVEL_HIGH>,
++		     <153 IRQ_TYPE_LEVEL_HIGH>;
++	interrupt-names = "spi_txe", "spi_rxf", "spi_done";
++	#address-cells = <1>;
++	#size-cells = <0>;
++	/*
++	 * RX sample delay = 10 ns. 5 ns under-samples at 50 MHz
++	 * (4 SSI cycles) and gives flaky reads / "bad node 255" (0xFF) under
++	 * load. Pair with single-lane reads below (the canaan,k230-spi quad
++	 * path is broken on this board). Controller default; spi-nand child
++	 * inherits.
++	 */
++	rx-sample-delay-ns = <10>;
++
++	spi-nand@0 {
++		compatible = "spi-nand";
++		reg = <0>;
++		spi-max-frequency = <50000000>;
++		spi-tx-bus-width = <1>;
++		spi-rx-bus-width = <1>;
++		nand-ecc-mode = "on-die";
++
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 { label = "uboot_spl_a"; reg = <0x0000000 0x0080000>; };
++			partition@80000 { label = "uboot_spl_b"; reg = <0x0080000 0x0080000>; };
++			partition@100000 { label = "uboot_a"; reg = <0x0100000 0x0200000>; };
++			partition@300000 { label = "uboot_b"; reg = <0x0300000 0x0200000>; };
++			partition@500000 { label = "uboot_env_a"; reg = <0x0500000 0x0080000>; };
++			partition@580000 { label = "uboot_env_b"; reg = <0x0580000 0x0080000>; };
++			partition@600000 { label = "rtt_a"; reg = <0x0600000 0x0400000>; };
++			partition@a00000 { label = "rtt_b"; reg = <0x0a00000 0x0400000>; };
++			partition@e00000 { label = "linux_a"; reg = <0x0e00000 0x0800000>; };
++			partition@1600000 { label = "linux_b"; reg = <0x1600000 0x0800000>; };
++			partition@1e00000 { label = "rootfs_a"; reg = <0x1e00000 0x3000000>; };
++			partition@4e00000 { label = "rootfs_b"; reg = <0x4e00000 0x3000000>; };
++			partition@7e00000 { label = "app_a"; reg = <0x7e00000 0x0e00000>; };
++			partition@8c00000 { label = "app_b"; reg = <0x8c00000 0x0e00000>; };
++			partition@c800000 { label = "data"; reg = <0xc800000 0x3800000>; };
++			partition@all_flash {
++				label = "all_flash";
++				reg = <0x0000000 0x10000000>;
++				read-only;
++			};
++		};
++	};
++};
++
++/*
++ * SPI2 (DW-SSI @0x91583000) — Sitronix ST7789V SPI TFT, driven in Linux via
++ * the staging fbtft driver (/dev/fb0). Same panel U-Boot lights for the boot
++ * logo (board/canaan/k230_nano3s/st7789v.c); U-Boot leaves the spi2 pads
++ * muxed, so no kernel pinctrl node is needed. Keep the base k230.dtsi
++ * compatible "canaan,k230-spi": it binds spi-dw-mmio via
++ * dw_spi_canaan_k230_init (the node's 9 independent IRQs).
++ *
++ * No "init" property: fbtft then runs fb_st7789v's built-in init_display()
++ * (sleep-out + pixel-format/porch/gamma/power + display-on), so Linux brings
++ * the controller up itself instead of relying on U-Boot's logo init
++ * persisting. Orientation/colour order come from rotate/bgr (fbtft set_var ->
++ * MADCTL). DC line = global pin 41 (&port41; gpiochip gpio41 enabled above).
++ */
++&spi2 {
++	status = "okay";
++
++	spi-lcd@0 {
++		compatible = "sitronix,st7789v";
++		reg = <0>;
++		spi-max-frequency = <25000000>;
++		spi-tx-bus-width = <1>;
++		spi-rx-bus-width = <1>;
++		buswidth = <8>;
++		fps = <30>;
++		width = <240>;
++		height = <240>;
++		rotate = <0>;
++		bgr;
++		dc-gpios = <&port41 0 GPIO_ACTIVE_HIGH>;
++		status = "okay";
++	};
++};
++
++&uart1 {
++	status = "okay";
++};
++
++/*
++ * ASIC-comm UART (the miner HAL uart_pro.c, via termios2; serial3 -> ttyS3).
++ * 96 MHz clock (via uart3_clk96) so the 8250 can reach the
++ * 4.8 Mbps ASIC baud with a fractional divisor (DLL=1 + DLF=4); the shared
++ * apb_clk (48 MHz, uart1 console) tops out
++ * at 3 Mbps. Hardware /1 divider set by U-Boot board_init.
++ */
++&uart3 {
++	clocks = <&uart3_clk96>;
++	dmas = <&pdma 7 0xfff 0 6>;
++	dma-names = "tx";
++	canaan,uart-tx-dma-sthr;
++	status = "okay";
++};
++
++&usb0 {
++	dr_mode = "host";
++	status = "okay";
++};
++
++&vo {
++	status = "disabled";
++};
++
++/*
++ * Second region: the SRAM record that tells the next boot a watchdog
++ * pre-timeout fired (WDIOF_CARDRESET).
++ */
++&watchdog0 {
++	reg = <0x0 0x91106000 0x0 0x800>,
++	      <0x0 0x80100000 0x0 0x40000>;
++};
++
++&{/soc} {
++	/*
++	 * ARGB LED (WS2812) on I2S0 + system DMA. The I2S0 data line is on
++	 * IO35 (muxed to I2S0 in U-Boot). The i2s node stays disabled — ws2812
++	 * owns the I2S regs.
++	 */
++	ws2812: ws2812@9140f000 {
++		compatible = "canaan,i2s-ws2812";
++		reg = <0x0 0x9140f000 0x0 0x1000>;
++		clocks = <&audio_dev_clk>;
++		clock-names = "i2sclk";
++		dmas = <&pdma 1 0xfff 0 0x14>;
++		dma-names = "tx";
++		status = "okay";
++	};
++
++	/*
++	 * K230 hardware spinlock block (SoC-common; sysctl_power/tsensor in
++	 * k230.dtsi reference lock numbers via their `hardlock` property).
++	 * Driver exports hardlock_lock/unlock/request_lock for in-kernel use.
++	 */
++	hardlock: canaan-hardlock@91104000 {
++		compatible = "canaan,k230-hardlock";
++		reg = <0x0 0x91104000 0x0 0x1000>;
++	};
++};
+-- 
+2.43.0
+

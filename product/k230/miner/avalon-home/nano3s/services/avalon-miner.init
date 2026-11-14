@@ -1,0 +1,147 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026, Canaan Creative Co., Ltd.
+#
+# For the licensing terms, see the LICENSE file (MIT License).
+#
+# NO WARRANTY. The Software is provided "AS IS", without warranty of any kind, express or
+# implied, including but not limited to the warranties of merchantability, fitness for a
+# particular purpose and non-infringement. In no event shall the authors or copyright
+# holders be liable for any claim, damages or other liability arising from, out of or in
+# connection with the Software or the use or other dealings in the Software.
+
+### BEGIN INIT INFO
+# Provides:          avalon-miner
+# Required-Start:    $local_fs $syslog $network
+# Required-Stop:     $local_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Avalon Nano3s miner (mm_miner supervisor + asic_miner)
+### END INIT INFO
+#
+# SysV init script for the miner. It mounts the app and data volumes, then
+# starts mm_miner, which powers the hashboard and spawns and supervises
+# core_miner and asic_miner.
+
+APP_DIR=/mntapp/release/linux/app
+MM_PID=/var/run/mm_miner.pid
+LOG_DIR=/data/userdata/log
+LOG=$LOG_DIR/miner.log
+OP_LOG=$LOG_DIR/miner_op.log
+
+op() {
+    mkdir -p "$LOG_DIR" 2>/dev/null
+    printf '[%s.000] [OP] avalon-miner: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" |
+        tee -a "$OP_LOG" >> "$LOG"
+}
+
+mlog() {
+    mkdir -p "$LOG_DIR" 2>/dev/null
+    printf '[%s.000] [%s] avalon-miner: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" \
+        "$(shift; printf '%s' "$*")" >> "$LOG"
+}
+
+# launch <dir> <binary> <pidfile>: run ./<binary> with <dir> as its working
+# directory, append its output to $LOG and record its PID.
+launch() {
+    if [ -f "$3" ] && kill -0 "$(cat "$3" 2>/dev/null)" 2>/dev/null; then
+        echo "  $2 is already running (pid $(cat "$3")); not starting a second copy"
+        mlog WARN "$2 is already running (pid $(cat "$3")); not started again"
+        return 0
+    fi
+    if [ ! -x "$1/$2" ]; then
+        echo "  ERROR: program $2 not found; it was not started"
+        mlog ERR "program $2 not found; it was not started"
+        return 1
+    fi
+    ( cd "$1" && exec ./"$2" ) >>"$LOG" 2>&1 &
+    echo $! > "$3"
+    echo "  $2 started (pid $!), output in $LOG"
+    mlog INFO "$2 started (pid $!)"
+}
+
+start() {
+    echo "Starting the miner:"
+    app_ok=1
+    if ! /usr/sbin/avalon-app-mount.sh; then
+        echo "  ERROR: application partition not mounted; the miner was not started"
+        app_ok=0
+    fi
+    data_ok=1
+    if ! /usr/sbin/avalon-data-mount.sh; then
+        data_ok=0
+    fi
+    if [ "$app_ok" = 1 ]; then
+        mkdir -p "$LOG_DIR"
+        if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 4194304 ]; then
+            # Copy, then truncate: miner_web may still hold miner.log open.
+            cp -f "$LOG" "$LOG.1" && : > "$LOG"
+        fi
+        printf '\n\n\n=== avalon-miner start %s ===\n' "$(date 2>/dev/null)" >> "$LOG"
+    fi
+    op "starting the miner"
+    [ "$data_ok" = 1 ] ||
+        mlog WARN "data partition not mounted; using default settings on the root file system," \
+            "changes are not saved to the data partition"
+    if [ "$app_ok" != 1 ]; then
+        mlog ERR "application partition not mounted; the miner was not started"
+        return 1
+    fi
+    slot=$(fw_printenv -n app_partition 2>/dev/null)
+    op "application slot ${slot:-unknown}"
+    # The RTL8723DU WiFi driver; /etc/modprobe.d/8723du.conf sets its
+    # parameters. The miner starts without WiFi if it does not load.
+    modprobe 8723du 2>/dev/null || {
+        echo "  WARN: WiFi driver (8723du) did not load; the miner starts without WiFi" >&2
+        mlog WARN "WiFi driver (8723du) did not load"
+    }
+    launch "$APP_DIR" mm_miner "$MM_PID"
+}
+
+stop() {
+    echo "Stopping the miner:"
+    op "stopping the miner"
+    [ -f "$MM_PID" ] && kill "$(cat "$MM_PID" 2>/dev/null)" 2>/dev/null
+    rm -f "$MM_PID"
+    sleep 1
+    # Include mm_miner: with a stale pidfile it may still be running and would
+    # respawn the children. The wait must cover mm_miner's own shutdown, which
+    # joins its children and powers the hashboard rail off; a SIGKILL during
+    # that leaves the rail on.
+    for pid in $(pidof mm_miner core_miner asic_miner); do
+        kill "$pid" 2>/dev/null
+    done
+    for _ in 1 2 3 4 5 6 7 8; do
+        pidof mm_miner core_miner asic_miner >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+    if pidof mm_miner >/dev/null 2>&1; then
+        echo "  WARN: mm_miner did not exit within 8 s; force-killing it" \
+            "(hashboard power may still be on)" >&2
+        mlog ERR "mm_miner did not exit within 8 s; force-killed (hashboard power may still be on)"
+    else
+        echo "  WARN: miner programs did not exit within 8 s; force-killing them" \
+            "(hashboard power was already turned off)" >&2
+        mlog WARN "miner programs did not exit within 8 s; force-killed"
+    fi
+    for pid in $(pidof mm_miner core_miner asic_miner); do
+        kill -9 "$pid" 2>/dev/null
+    done
+    return 0
+}
+
+case "$1" in
+    start) start || exit 1 ;;
+    stop) stop ;;
+    restart) stop; sleep 1; start || exit 1 ;;
+    status)
+        for n in mm_miner core_miner asic_miner; do
+            if pidof "$n" >/dev/null 2>&1; then echo "  $n: running"; else echo "  $n: stopped"; fi
+        done
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+exit 0

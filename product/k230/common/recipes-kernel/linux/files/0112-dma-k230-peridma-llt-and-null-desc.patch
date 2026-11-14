@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] dma: k230_peridma: fix the llt link address and a null desc
+
+Fix two faults in the K230 peripheral DMA driver:
+
+ - pdma_llt_cal() stores the CPU virtual address of the next LLT entry
+   in next_llt_addr, but the engine walks the chain by physical address.
+   A multi-segment transfer fetches a descriptor from a bogus address
+   and corrupts memory. Use the coherent DMA address.
+
+ - k230_peridma_interrupt() dereferences desc->cyclic for a channel
+   whose virtual channel has no active descriptor, after a spurious or
+   late interrupt, and returns from the whole handler on a NULL virtual
+   channel, leaving the other channels' interrupts unserviced. Skip
+   such channels instead.
+
+Upstream-Status: Pending
+---
+ drivers/dma/k230_peridma.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/dma/k230_peridma.c b/drivers/dma/k230_peridma.c
+index 227d5ba7c..96ac412bc 100644
+--- a/drivers/dma/k230_peridma.c
++++ b/drivers/dma/k230_peridma.c
+@@ -814,8 +814,14 @@ static u32 *pdma_llt_cal(struct device *dev, struct k230_peridma_hwdesc *hwdesc,
+ 			llt_list[i].next_llt_addr = 0;
+ 		} else {
+ 			llt_list[i].line_size = PDMA_MAX_LINE_SIZE;
++			/*
++			 * HW walks the LLT chain by physical address, so the
++			 * next entry is addressed from the coherent DMA base,
++			 * not by its CPU virtual address.
++			 */
+ 			llt_list[i].next_llt_addr =
+-				(u32)(uintptr_t)(&llt_list[i + 1]);
++				(u32)(g_pdma_llt_list[chn].llt_list_p +
++				      (i + 1) * sizeof(struct pdma_llt_t));
+ 		}
+ 	}
+ 
+@@ -994,13 +1000,21 @@ static irqreturn_t k230_peridma_interrupt(int irq, void *dev_id)
+ 		ch_id = i;
+ 		vchan = priv->pchan[ch_id].vchan;
+ 		if (vchan == NULL)
+-			return IRQ_HANDLED;
++			continue;
+ 
+ 		spin_lock(&vchan->vchan.lock);
++		desc = vchan->desc;
++		if (!desc) {
++			/*
++			 * A spurious or late interrupt finds desc cleared by
++			 * xfer_complete.
++			 */
++			spin_unlock(&vchan->vchan.lock);
++			continue;
++		}
+ 		//dev_vdbg(vchan2dev(vchan),
+ 		//"k230_peridma_interrupt: process Transfer done irq of phy ch%d, int_status(%x)\n",
+ 		//ch_id, int_stat0);
+-		desc = vchan->desc;
+ 		//printk("========desc->cyclic:0x%llx\n",desc->cyclic);
+ 		if (desc->cyclic) {
+ 			hwdesc = desc->cyclic;
+-- 
+2.43.0
+

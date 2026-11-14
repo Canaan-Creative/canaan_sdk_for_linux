@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] lib: gunzip: make gunzip() weak
+
+The K230 provides a gunzip() that decompresses on the UGZIP hardware
+block and falls back to software zlib. Make the generic gunzip() weak
+so that SoC code can override it.
+
+Upstream-Status: Pending
+---
+ lib/gunzip.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/lib/gunzip.c b/lib/gunzip.c
+index a05dcde9..011c9ec8 100644
+--- a/lib/gunzip.c
++++ b/lib/gunzip.c
+@@ -72,7 +72,9 @@ __rcode int gzip_parse_header(const unsigned char *src, unsigned long len)
+ 	return i;
+ }
+ 
+-__rcode int gunzip(void *dst, int dstlen, unsigned char *src, unsigned long *lenp)
++/* Weak so that arch/riscv/cpu/k230/unzip.c can decompress in hardware. */
++__weak __rcode int gunzip(void *dst, int dstlen, unsigned char *src,
++			  unsigned long *lenp)
+ {
+ 	int offset = gzip_parse_header(src, *lenp);
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] fbdev: open the framebuffer close-on-exec
+
+mm_miner keeps /dev/fb0 open for the life of the process and starts
+long-lived children (core_miner, asic_miner, udhcpc -b through
+system()). Opened without O_CLOEXEC, every one of them inherits the
+framebuffer and holds it after mm_miner exits.
+
+Upstream-Status: Pending
+
+--- a/src/drivers/display/fb/lv_linux_fbdev.c
++++ b/src/drivers/display/fb/lv_linux_fbdev.c
+@@ -127,7 +127,7 @@
+     if(dsc->fbfd > 0) close(dsc->fbfd);
+ 
+     /* Open the file for reading and writing*/
+-    dsc->fbfd = open(dsc->devname, O_RDWR);
++    dsc->fbfd = open(dsc->devname, O_RDWR | O_CLOEXEC);
+     if(dsc->fbfd == -1) {
+         perror("Error: cannot open framebuffer device");
+         return;

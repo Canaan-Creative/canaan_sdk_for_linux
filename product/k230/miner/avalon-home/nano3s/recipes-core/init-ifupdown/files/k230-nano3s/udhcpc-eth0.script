@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026, Canaan Creative Co., Ltd.
+#
+# For the licensing terms, see the LICENSE file (MIT License).
+#
+# NO WARRANTY. The Software is provided "AS IS", without warranty of any kind, express or
+# implied, including but not limited to the warranties of merchantability, fitness for a
+# particular purpose and non-infringement. In no event shall the authors or copyright
+# holders be liable for any claim, damages or other liability arising from, out of or in
+# connection with the Software or the use or other dealings in the Software.
+
+# udhcpc event script for eth0, set with -s in /etc/network/interfaces. It runs
+# the default script, then restarts chronyd on a new lease while the clock is
+# still unset (before 2001), so time sync starts once the network is up.
+
+/usr/share/udhcpc/default.script "$@"
+rc=$?
+
+if [ "$1" = "bound" ] && [ "$(date +%s)" -lt 1000000000 ]; then
+    [ -x /etc/init.d/chronyd ] && /etc/init.d/chronyd restart >/dev/null 2>&1
+fi
+
+exit $rc

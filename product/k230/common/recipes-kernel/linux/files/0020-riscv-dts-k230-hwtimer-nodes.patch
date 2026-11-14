@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: add the hwtimer nodes
+
+Describe the six channels of the K230 hardware timer block at
+0x91105800 as canaan,k230-hwtimer nodes, index 0..5. The nodes have no
+effect unless CANAAN_HWTIMER is built.
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/k230.dtsi | 37 ++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+index 7ad29bd27..051289e0c 100644
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -456,6 +456,43 @@ rtc: rtc@0x91000c00 {
+ 			reg = <0x0 0x91000c00 0x0 0x20>;
+ 		};
+ 
++		/* Canaan K230 hwtimers (6 instances, shared block @0x91105800). */
++		timer0: timer0@91105800 {
++			compatible = "canaan,k230-hwtimer";
++			reg = <0x0 0x91105800 0x0 0x800>;
++			index = <0>;
++		};
++
++		timer1: timer1@91105800 {
++			compatible = "canaan,k230-hwtimer";
++			reg = <0x0 0x91105800 0x0 0x800>;
++			index = <1>;
++		};
++
++		timer2: timer2@91105800 {
++			compatible = "canaan,k230-hwtimer";
++			reg = <0x0 0x91105800 0x0 0x800>;
++			index = <2>;
++		};
++
++		timer3: timer3@91105800 {
++			compatible = "canaan,k230-hwtimer";
++			reg = <0x0 0x91105800 0x0 0x800>;
++			index = <3>;
++		};
++
++		timer4: timer4@91105800 {
++			compatible = "canaan,k230-hwtimer";
++			reg = <0x0 0x91105800 0x0 0x800>;
++			index = <4>;
++		};
++
++		timer5: timer5@91105800 {
++			compatible = "canaan,k230-hwtimer";
++			reg = <0x0 0x91105800 0x0 0x800>;
++			index = <5>;
++		};
++
+ 		spi0: spi@91584000 {
+ 			compatible = "canaan,k230-spi";
+ 			reg = <0x0 0x91584000 0x0 0x1000>;
+-- 
+2.43.0
+

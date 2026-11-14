@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] crypto: kendryte-aes: hold the puf dma lock
+
+The AES driver programs the PUF DMA channel that the hash driver also
+uses, with no lock. Hold the kendryte-puf lock across each encrypt and
+decrypt.
+
+Upstream-Status: Pending
+---
+ drivers/crypto/canaan/Kconfig        |  1 +
+ drivers/crypto/canaan/kendryte-aes.c | 15 +++++++++++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/crypto/canaan/Kconfig b/drivers/crypto/canaan/Kconfig
+index d715b9689..5b8c31787 100644
+--- a/drivers/crypto/canaan/Kconfig
++++ b/drivers/crypto/canaan/Kconfig
+@@ -6,6 +6,7 @@ config CRYPTO_DEV_KENDRYTE_CRYP
+     tristate "Support for K230 crypto accelerators"
+     select CRYPTO_AES
+     select CRYPTO_BLKCIPHER
++    select CRYPTO_DEV_KENDRYTE_PUF
+     default ARCH_CANAAN
+     help
+         This driver interfaces with the hardware crypto
+diff --git a/drivers/crypto/canaan/kendryte-aes.c b/drivers/crypto/canaan/kendryte-aes.c
+index b6eb19bee..e595a4318 100644
+--- a/drivers/crypto/canaan/kendryte-aes.c
++++ b/drivers/crypto/canaan/kendryte-aes.c
+@@ -23,6 +23,7 @@
+ #include <crypto/scatterwalk.h>
+ #include <crypto/gcm.h>
+ #include "kendryte-aes.h"
++#include "kendryte-puf.h"
+ 
+ // #define _debug_print
+ 
+@@ -1270,12 +1271,22 @@ static int kendryte_cra_init(struct crypto_tfm *tfm)
+ 
+ static int kendryte_gcm_aes_encrypt(struct aead_request *req)
+ {
+-	return kendryte_gcm_aes_crypt(req, true);
++	int ret;
++
++	kendryte_puf_lock();
++	ret = kendryte_gcm_aes_crypt(req, true);
++	kendryte_puf_unlock();
++	return ret;
+ }
+ 
+ static int kendryte_gcm_aes_decrypt(struct aead_request *req)
+ {
+-	return kendryte_gcm_aes_crypt(req, false);
++	int ret;
++
++	kendryte_puf_lock();
++	ret = kendryte_gcm_aes_crypt(req, false);
++	kendryte_puf_unlock();
++	return ret;
+ }
+ 
+ static int kendryte_gcm_aes_init(struct crypto_aead *tfm)
+-- 
+2.43.0
+

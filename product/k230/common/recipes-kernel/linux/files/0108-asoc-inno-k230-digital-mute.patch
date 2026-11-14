@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] ASoC: inno_k230: add a digital mute and PCM controls
+
+Add a DAC digital mute that sets the DAC volume register to zero and
+restores the default volume on unmute. The playback switch, and a
+playback volume of zero, use it instead of the headphone output mutes.
+Add "PCM" and "PCM Switch" mixer controls on the playback volume and
+switch for userspace that expects them.
+
+Upstream-Status: Pending
+---
+ sound/soc/codecs/inno_k230.c     | 29 ++++++++++++++++++++++++-----
+ sound/soc/codecs/inno_k230_reg.c | 32 ++++++++++++++++++++++++++++++++
+ sound/soc/codecs/inno_k230_reg.h |  2 ++
+ 3 files changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/sound/soc/codecs/inno_k230.c b/sound/soc/codecs/inno_k230.c
+index 2dd8840bc..0e9804a02 100644
+--- a/sound/soc/codecs/inno_k230.c
++++ b/sound/soc/codecs/inno_k230.c
+@@ -96,12 +96,11 @@ static int inno_playback_get_vol(struct snd_kcontrol *kcontrol,
+ static int inno_playback_put_vol(struct snd_kcontrol *kcontrol,
+ 				 struct snd_ctl_elem_value *ucontrol)
+ {
+-	//printk("=========inno_put_vol:%d\n",ucontrol->value.integer.value[0]);
+-
+ 	audio_codec_dac_set_hpoutl_gain(ucontrol->value.integer.value[0] -
+ 					INNO_VOLUME_INVERT_VALUE);
+ 	audio_codec_dac_set_hpoutr_gain(ucontrol->value.integer.value[0] -
+ 					INNO_VOLUME_INVERT_VALUE);
++
+ 	return 0;
+ }
+ 
+@@ -158,7 +157,7 @@ static int snd_inno_ctl_get(struct snd_kcontrol *kcontrol,
+ 		ucontrol->value.integer.value[0] =
+ 			value + INNO_VOLUME_INVERT_VALUE;
+ 	} else if (kcontrol->private_value == INNO_PCM_PLAYBACK_MUTE) {
+-		audio_codec_dac_get_hpoutl_mute(&mute);
++		audio_codec_dac_get_digital_mute(&mute);
+ 		ucontrol->value.integer.value[0] = !mute;
+ 	} else if (kcontrol->private_value == INNO_PCM_CAPTURE_VOLUME) {
+ 		audio_codec_adc_get_micl_gain(&value);
+@@ -182,9 +181,13 @@ static int snd_inno_ctl_put(struct snd_kcontrol *kcontrol,
+ 		audio_codec_dac_set_hpoutr_gain(
+ 			ucontrol->value.integer.value[0] -
+ 			INNO_VOLUME_INVERT_VALUE);
++
++		if (ucontrol->value.integer.value[0] == 0)
++			audio_codec_dac_digital_mute(true);
++		else
++			audio_codec_dac_digital_mute(false);
+ 	} else if (kcontrol->private_value == INNO_PCM_PLAYBACK_MUTE) {
+-		audio_codec_dac_hpoutl_mute(!ucontrol->value.integer.value[0]);
+-		audio_codec_dac_hpoutr_mute(!ucontrol->value.integer.value[0]);
++		audio_codec_dac_digital_mute(!ucontrol->value.integer.value[0]);
+ 	} else if (kcontrol->private_value == INNO_PCM_CAPTURE_VOLUME) {
+ 		audio_codec_adc_set_micl_gain(ucontrol->value.integer.value[0]);
+ 		audio_codec_adc_set_micl_gain(ucontrol->value.integer.value[0]);
+@@ -229,6 +232,22 @@ static const struct snd_kcontrol_new inno_snd_control[] = {
+ 		.put = snd_inno_ctl_put,
+ 		.private_value = INNO_PCM_CAPTURE_MUTE,
+ 	},
++	{
++		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++		.name = "PCM",
++		.info = snd_inno_ctl_vol,
++		.get = snd_inno_ctl_get,
++		.put = snd_inno_ctl_put,
++		.private_value = INNO_PCM_PLAYBACK_VOLUME,
++	},
++	{
++		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++		.name = "PCM Switch",
++		.info = snd_inno_ctl_vol,
++		.get = snd_inno_ctl_get,
++		.put = snd_inno_ctl_put,
++		.private_value = INNO_PCM_PLAYBACK_MUTE,
++	},
+ 
+ };
+ 
+diff --git a/sound/soc/codecs/inno_k230_reg.c b/sound/soc/codecs/inno_k230_reg.c
+index d4d0d668c..53dca453c 100644
+--- a/sound/soc/codecs/inno_k230_reg.c
++++ b/sound/soc/codecs/inno_k230_reg.c
+@@ -44,6 +44,7 @@ static bool g_adc_left_mute;
+ static bool g_adc_right_mute;
+ static bool g_dac_left_mute;
+ static bool g_dac_right_mute;
++static bool g_dac_digital_mute;
+ 
+ static int _reset_snd_values(struct acodec_sound_values *snd_values)
+ {
+@@ -1254,6 +1255,31 @@ int audio_codec_dac_hpoutr_mute(bool mute)
+ 	return 0;
+ }
+ 
++int audio_codec_dac_digital_mute(bool mute)
++{
++	union reg_6_t reg6;
++
++	if (mute) {
++		if (g_dac_digital_mute)
++			return 0;
++		reg6.reg_data = readl(&audio_codec_reg->reg_06);
++		reg6.reg_6.dac_vol = 0x0;
++		writel(reg6.reg_data, &audio_codec_reg->reg_06);
++		msleep(AUDIO_REG_CONFIG_NORMAL_DELAY);
++	} else {
++		if (!g_dac_digital_mute)
++			return 0;
++		reg6.reg_data = readl(&audio_codec_reg->reg_06);
++		reg6.reg_6.dac_vol = g_snd_default_values.dac_volumel;
++		writel(reg6.reg_data, &audio_codec_reg->reg_06);
++		msleep(AUDIO_REG_CONFIG_NORMAL_DELAY);
++	}
++
++	g_dac_digital_mute = mute;
++
++	return 0;
++}
++
+ int audio_codec_dac_get_hpoutl_mute(bool *mute)
+ {
+ 	*mute = g_dac_left_mute;
+@@ -1266,6 +1292,12 @@ int audio_codec_dac_get_hpoutr_mute(bool *mute)
+ 	return 0;
+ }
+ 
++int audio_codec_dac_get_digital_mute(bool *mute)
++{
++	*mute = g_dac_digital_mute;
++	return 0;
++}
++
+ // static int convert_dac_volume(float gain, unsigned int *reg_val)
+ // {
+ //     unsigned int reg_value = 0;
+diff --git a/sound/soc/codecs/inno_k230_reg.h b/sound/soc/codecs/inno_k230_reg.h
+index c5607aa5d..550aa0381 100644
+--- a/sound/soc/codecs/inno_k230_reg.h
++++ b/sound/soc/codecs/inno_k230_reg.h
+@@ -477,9 +477,11 @@ int audio_codec_dac_get_hpoutr_gain(int *gain);
+ 
+ int audio_codec_dac_hpoutl_mute(bool mute);
+ int audio_codec_dac_hpoutr_mute(bool mute);
++int audio_codec_dac_digital_mute(bool mute);
+ 
+ int audio_codec_dac_get_hpoutl_mute(bool *mute);
+ int audio_codec_dac_get_hpoutr_mute(bool *mute);
++int audio_codec_dac_get_digital_mute(bool *mute);
+ 
+ // int  audio_codec_dacl_set_volume(float volume);
+ // int  audio_codec_dacr_set_volume(float volume);
+-- 
+2.43.0
+

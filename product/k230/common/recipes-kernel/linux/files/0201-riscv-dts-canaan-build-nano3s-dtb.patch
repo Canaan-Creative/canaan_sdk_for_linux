@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: canaan: build the avalon nano3s dtb
+
+Build k230-nano3s.dtb with CONFIG_ARCH_CANAAN.
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/Makefile | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/riscv/boot/dts/canaan/Makefile b/arch/riscv/boot/dts/canaan/Makefile
+index 2cabb52b7..cf97adc4f 100644
+--- a/arch/riscv/boot/dts/canaan/Makefile
++++ b/arch/riscv/boot/dts/canaan/Makefile
+@@ -3,6 +3,7 @@ dtb-$(CONFIG_ARCH_CANAAN) += canaan_kd233.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k210_generic.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k230-canmv.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k230d-canmv.dtb
++dtb-$(CONFIG_ARCH_CANAAN) += k230-nano3s.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += k230-evb.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += sipeed_maix_bit.dtb
+ dtb-$(CONFIG_ARCH_CANAAN) += sipeed_maix_dock.dtb
+-- 
+2.43.0
+

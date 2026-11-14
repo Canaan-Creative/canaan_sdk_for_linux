@@ -1,0 +1,381 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] canaan-hwtimer: add the k230 hardware timer driver
+
+Add a driver for the K230 hardware timer block, compatible
+canaan,k230-hwtimer. Each timer channel described in the device tree is
+a misc device /dev/timerN; reading it returns the counter frequency
+measured over the window set with the TMIOC_SET_TIMEOUT ioctl.
+
+Upstream-Status: Pending
+---
+ drivers/canaan-hwtimer/Kconfig          |  13 +
+ drivers/canaan-hwtimer/Makefile         |   7 +
+ drivers/canaan-hwtimer/canaan-hwtimer.c | 321 ++++++++++++++++++++++++
+ 3 files changed, 341 insertions(+)
+ create mode 100644 drivers/canaan-hwtimer/Kconfig
+ create mode 100644 drivers/canaan-hwtimer/Makefile
+ create mode 100644 drivers/canaan-hwtimer/canaan-hwtimer.c
+
+diff --git a/drivers/canaan-hwtimer/Kconfig b/drivers/canaan-hwtimer/Kconfig
+new file mode 100644
+index 000000000..333a1a38e
+--- /dev/null
++++ b/drivers/canaan-hwtimer/Kconfig
+@@ -0,0 +1,13 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (c) 2026, Canaan Creative Co., Ltd.
++menu "canaan-hwtimer"
++
++config CANAAN_HWTIMER
++	bool "canaan hwtimer driver"
++	help
++	  Driver for the Canaan K230 hardware timer block. Each timer
++	  channel described in the device tree is exposed as a misc
++	  device /dev/timerN; reading it returns the counter frequency
++	  measured over the window set with the TMIOC_SET_TIMEOUT ioctl.
++
++endmenu
+diff --git a/drivers/canaan-hwtimer/Makefile b/drivers/canaan-hwtimer/Makefile
+new file mode 100644
+index 000000000..26d8ac304
+--- /dev/null
++++ b/drivers/canaan-hwtimer/Makefile
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0-only
++# Copyright (c) 2026, Canaan Creative Co., Ltd.
++#
++# Makefile for the hwtimer drivers.
++#
++
++obj-$(CONFIG_CANAAN_HWTIMER)		+= canaan-hwtimer.o
+diff --git a/drivers/canaan-hwtimer/canaan-hwtimer.c b/drivers/canaan-hwtimer/canaan-hwtimer.c
+new file mode 100644
+index 000000000..2bd2b5486
+--- /dev/null
++++ b/drivers/canaan-hwtimer/canaan-hwtimer.c
+@@ -0,0 +1,321 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/errno.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/io.h>
++#include <linux/atomic.h>
++#include <linux/timer.h>
++#include <linux/miscdevice.h>
++#include <linux/platform_device.h>
++#include <linux/interrupt.h>
++#include <linux/property.h>
++#include <linux/spinlock.h>
++
++#define K230_TIMER0_CHANL	(0x00)
++#define K230_TIMER1_CHANL	(0x14)
++#define K230_TIMER2_CHANL	(0x28)
++#define K230_TIMER3_CHANL	(0x3c)
++#define K230_TIMER4_CHANL	(0x50)
++#define K230_TIMER5_CHANL	(0x64)
++#define LOAD_COUNT		(0x00)
++#define CURRENT_VALUE		(0x04)
++#define CONTROL			(0x08)
++#define EOI			(0x0c)
++#define INTR_STAT		(0x10)
++#define K230_TIMER_NUM		6
++#define CANAAN_DRIVER_NAME	"canaan-hwtimer"
++
++static void __iomem *addr;
++
++#define TMIOC_SET_TIMEOUT _IOW('T', 0x20, int)
++
++struct k230_hwtimer {
++	void __iomem		*base;
++	struct device		*dev;
++	struct miscdevice	mdev;
++	struct timer_list	softtimer;
++	/* protects ts_old, ts_new, old, new and timeout */
++	spinlock_t		lock;
++	unsigned int		timeout; /* ms */
++	struct timespec64	ts_old, ts_new;
++	unsigned int		old, new;
++	int			index;
++};
++
++static void k230_hwtimer_reg_init(void __iomem *base)
++{
++	int value;
++
++	/* stop all timer */
++	writel(0x0, base + K230_TIMER0_CHANL + CONTROL);
++	writel(0x0, base + K230_TIMER1_CHANL + CONTROL);
++	writel(0x0, base + K230_TIMER2_CHANL + CONTROL);
++	writel(0x0, base + K230_TIMER3_CHANL + CONTROL);
++	writel(0x0, base + K230_TIMER4_CHANL + CONTROL);
++	writel(0x0, base + K230_TIMER5_CHANL + CONTROL);
++
++	/* free-running mode */
++	value = readl(base + K230_TIMER0_CHANL + CONTROL);
++	value &= ~0x2;
++
++	writel(value, base + K230_TIMER0_CHANL + CONTROL);
++	writel(value, base + K230_TIMER1_CHANL + CONTROL);
++	writel(value, base + K230_TIMER2_CHANL + CONTROL);
++	writel(value, base + K230_TIMER3_CHANL + CONTROL);
++	writel(value, base + K230_TIMER4_CHANL + CONTROL);
++	writel(value, base + K230_TIMER5_CHANL + CONTROL);
++
++	writel(0xffffffff, base + K230_TIMER0_CHANL + LOAD_COUNT);
++	writel(0xffffffff, base + K230_TIMER1_CHANL + LOAD_COUNT);
++	writel(0xffffffff, base + K230_TIMER2_CHANL + LOAD_COUNT);
++	writel(0xffffffff, base + K230_TIMER3_CHANL + LOAD_COUNT);
++	writel(0xffffffff, base + K230_TIMER4_CHANL + LOAD_COUNT);
++	writel(0xffffffff, base + K230_TIMER5_CHANL + LOAD_COUNT);
++}
++
++static void k230_hwtimer_start(struct k230_hwtimer *timer, int enable)
++{
++	void __iomem *base = timer->base;
++	int id = timer->index;
++	char channel;
++	unsigned int value;
++
++	switch (id) {
++	case 0:
++		channel = K230_TIMER0_CHANL;
++		break;
++	case 1:
++		channel = K230_TIMER1_CHANL;
++		break;
++	case 2:
++		channel = K230_TIMER2_CHANL;
++		break;
++	case 3:
++		channel = K230_TIMER3_CHANL;
++		break;
++	case 4:
++		channel = K230_TIMER4_CHANL;
++		break;
++	case 5:
++		channel = K230_TIMER5_CHANL;
++		break;
++	default:
++		return;
++	}
++
++	if (enable) {
++		value = readl(base + channel + CONTROL);
++		value &= ~0x4;
++		value |= 0x3;
++		writel(value, base + channel + CONTROL);
++	} else {
++		value = readl(base + channel + CONTROL);
++		value &= ~0x1;
++		value |= 0x4;
++		writel(value, base + channel + CONTROL);
++	}
++}
++
++static void softtimer_func(struct timer_list *soft_timer)
++{
++	unsigned int value, timeout;
++	struct k230_hwtimer *timer = from_timer(timer, soft_timer, softtimer);
++	void __iomem *reg = timer->base + (timer->index * 0x14) + CURRENT_VALUE;
++	struct timespec64 timetmp;
++
++	if (timer->index > 5)
++		return;
++	value = readl(reg);
++	ktime_get_boottime_ts64(&timetmp);
++	spin_lock(&timer->lock);
++	timer->old = timer->new;
++	timer->ts_old = timer->ts_new;
++
++	timer->new = value;
++	timer->ts_new = timetmp;
++	timeout = timer->timeout;
++	spin_unlock(&timer->lock);
++
++	mod_timer(&timer->softtimer, jiffies + msecs_to_jiffies(timeout));
++}
++
++static int k230_hwtimer_open(struct inode *inode, struct file *file)
++{
++	struct k230_hwtimer *timer =
++		container_of(file->private_data, struct k230_hwtimer, mdev);
++
++	k230_hwtimer_start(timer, 1);
++	mod_timer(&timer->softtimer,
++		  jiffies + msecs_to_jiffies(READ_ONCE(timer->timeout)));
++	return 0;
++}
++
++static int k230_hwtimer_release(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static ssize_t k230_hwtimer_read(struct file *file, char __user *buf,
++				 size_t len, loff_t *ppos)
++{
++	struct k230_hwtimer *timer =
++		container_of(file->private_data, struct k230_hwtimer, mdev);
++	u32 old = 0, new = 0;
++	unsigned int freq = 0;
++	unsigned int timeout;
++	struct timespec64 ts_diff;
++	s64 time_diff;
++
++	spin_lock_bh(&timer->lock);
++	ts_diff = timespec64_sub(timer->ts_new, timer->ts_old);
++	old = timer->old;
++	new = timer->new;
++	timeout = timer->timeout;
++	spin_unlock_bh(&timer->lock);
++	time_diff = timespec64_to_ns(&ts_diff) / 1000000;
++
++	if (len < sizeof(freq) || timer->index > 5)
++		return -EINVAL;
++
++	if (time_diff > 0 && time_diff < (timeout * 2)) {
++		if (new < old)
++			freq = (1000 * (old - new)) / time_diff;
++		else if (new > old)
++			freq = (1000 * (0xffffffff - new + old)) / time_diff;
++	}
++
++	if (copy_to_user(buf, &freq, sizeof(freq)))
++		return -EFAULT;
++
++	return sizeof(freq);
++}
++
++static long k230_hwtimer_ioctl(struct file *file, unsigned int cmd,
++			       unsigned long arg)
++{
++	struct k230_hwtimer *timer =
++		container_of(file->private_data, struct k230_hwtimer, mdev);
++	unsigned int timeout_val;
++	void __user *argp = (void __user *)arg;
++
++	if (!timer)
++		return -ENOENT;
++
++	if (copy_from_user(&timeout_val, argp, sizeof(timeout_val)))
++		return -EINVAL;
++
++	if (timeout_val == 0 || timeout_val > UINT_MAX / 2000) {
++		pr_err("timeout value out of range\n");
++		return -EINVAL;
++	}
++	timeout_val *= 1000;
++
++	if (cmd == TMIOC_SET_TIMEOUT) {
++		k230_hwtimer_start(timer, 0);
++		spin_lock_bh(&timer->lock);
++		WRITE_ONCE(timer->timeout, timeout_val);
++		timer->old = 0;
++		timer->new = 0;
++		timer->ts_old = (struct timespec64){ 0 };
++		timer->ts_new = (struct timespec64){ 0 };
++		spin_unlock_bh(&timer->lock);
++		mod_timer(&timer->softtimer,
++			  jiffies + msecs_to_jiffies(timeout_val));
++		k230_hwtimer_start(timer, 1);
++	} else {
++		pr_err("cmd error\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static const struct file_operations hwtimer_fops = {
++	.owner = THIS_MODULE,
++	.open = k230_hwtimer_open,
++	.read = k230_hwtimer_read,
++	.unlocked_ioctl = k230_hwtimer_ioctl,
++	.release = k230_hwtimer_release,
++};
++
++static int k230_hwtimer_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	int ret;
++	struct k230_hwtimer *k230_timer;
++	struct miscdevice *misc;
++
++	k230_timer = devm_kzalloc(dev, sizeof(*k230_timer), GFP_KERNEL);
++	if (!k230_timer)
++		return -ENOMEM;
++
++	if (device_property_read_u32(dev, "index", &k230_timer->index) ||
++	    k230_timer->index < 0 || k230_timer->index >= K230_TIMER_NUM) {
++		dev_err(dev, "missing or invalid timer index\n");
++		return -EINVAL;
++	}
++
++	if (!addr) {
++		addr = of_iomap(dev->of_node, 0);
++		if (!addr)
++			return -ENOMEM;
++		k230_hwtimer_reg_init(addr);
++	}
++
++	k230_timer->base = addr;
++	k230_timer->dev = dev;
++	spin_lock_init(&k230_timer->lock);
++	k230_timer->timeout = 1000;
++	timer_setup(&k230_timer->softtimer, &softtimer_func, 0);
++	dev_set_drvdata(&pdev->dev, k230_timer);
++
++	misc = &k230_timer->mdev;
++	misc->name =
++		devm_kasprintf(dev, GFP_KERNEL, "timer%d", k230_timer->index);
++	if (!misc->name)
++		return -ENOMEM;
++	misc->minor = MISC_DYNAMIC_MINOR;
++	misc->fops = &hwtimer_fops;
++	misc->parent = dev;
++
++	ret = misc_register(misc);
++	if (ret < 0) {
++		pr_err("hwtimer register cdev failed!\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static void k230_hwtimer_remove(struct platform_device *pdev)
++{
++	struct k230_hwtimer *k230_timer = platform_get_drvdata(pdev);
++
++	misc_deregister(&k230_timer->mdev);
++	timer_shutdown_sync(&k230_timer->softtimer);
++}
++
++static const struct of_device_id k230_of_match[] = {
++	{ .compatible = "canaan,k230-hwtimer", .data = (void *)0 },
++	{ /* Sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, k230_of_match);
++
++static struct platform_driver k230_hwtimer_driver = {
++	.driver		= {
++		.name	= CANAAN_DRIVER_NAME,
++		.of_match_table = k230_of_match,
++	},
++	.probe		= k230_hwtimer_probe,
++	.remove_new	= k230_hwtimer_remove,
++};
++module_platform_driver(k230_hwtimer_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Canaan K230 hwtimer driver");
++MODULE_ALIAS("platform:" CANAAN_DRIVER_NAME);
+-- 
+2.43.0
+

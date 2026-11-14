@@ -1,0 +1,1324 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: k230: add c908 cpu support files
+
+Add the CPU support files for the K230 XuanTie C908 core: cache
+maintenance, the system controller interface and register map, the
+scripts that convert DDR training register sequences into C init
+tables, and a driver for the hardware gzip decompressor (UGZIP).
+k230_compat.h carries the definitions that the K230 board and SoC code
+is built with.
+
+Upstream-Status: Pending
+---
+ arch/riscv/cpu/k230/cache.c       | 241 +++++++++++++++++++
+ arch/riscv/cpu/k230/config.mk     |  48 ++++
+ arch/riscv/cpu/k230/ddr.sh        | 116 +++++++++
+ arch/riscv/cpu/k230/ddr_2d.sh     | 151 ++++++++++++
+ arch/riscv/cpu/k230/k230_compat.h |  44 ++++
+ arch/riscv/cpu/k230/platform.h    | 176 ++++++++++++++
+ arch/riscv/cpu/k230/sysctl.c      |  21 ++
+ arch/riscv/cpu/k230/sysctl.h      |  55 +++++
+ arch/riscv/cpu/k230/unzip.c       | 382 ++++++++++++++++++++++++++++++
+ 9 files changed, 1234 insertions(+)
+ create mode 100644 arch/riscv/cpu/k230/cache.c
+ create mode 100644 arch/riscv/cpu/k230/config.mk
+ create mode 100755 arch/riscv/cpu/k230/ddr.sh
+ create mode 100755 arch/riscv/cpu/k230/ddr_2d.sh
+ create mode 100644 arch/riscv/cpu/k230/k230_compat.h
+ create mode 100644 arch/riscv/cpu/k230/platform.h
+ create mode 100644 arch/riscv/cpu/k230/sysctl.c
+ create mode 100644 arch/riscv/cpu/k230/sysctl.h
+ create mode 100644 arch/riscv/cpu/k230/unzip.c
+
+diff --git a/arch/riscv/cpu/k230/cache.c b/arch/riscv/cpu/k230/cache.c
+new file mode 100644
+index 00000000..6faa7af2
+--- /dev/null
++++ b/arch/riscv/cpu/k230/cache.c
+@@ -0,0 +1,241 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++#include <cpu_func.h>
++#include <dm.h>
++#include <asm/cache.h>
++#include <dm/uclass-internal.h>
++#include <cache.h>
++#include <asm/csr.h>
++
++#ifndef __ASM
++#define __ASM __asm
++#endif
++
++#ifndef __ALWAYS_STATIC_INLINE
++#define __ALWAYS_STATIC_INLINE __attribute__((always_inline)) static inline
++#endif
++
++#ifndef __STATIC_INLINE
++#define __STATIC_INLINE static inline
++#endif
++
++#ifndef __ICACHE_PRESENT
++#define __ICACHE_PRESENT 1U
++#endif
++
++#ifndef __DCACHE_PRESENT
++#define __DCACHE_PRESENT 1U
++#endif
++
++/* CACHE Register Definitions */
++#define CACHE_MHCR_WBR_Pos	8U				/*!< CACHE MHCR: WBR Position */
++#define CACHE_MHCR_WBR_Msk	(0x1UL << CACHE_MHCR_WBR_Pos)	/*!< CACHE MHCR: WBR Mask */
++
++#define CACHE_MHCR_IBPE_Pos	7U				/*!< CACHE MHCR: IBPE Position */
++#define CACHE_MHCR_IBPE_Msk	(0x1UL << CACHE_MHCR_IBPE_Pos)	/*!< CACHE MHCR: IBPE Mask */
++
++#define CACHE_MHCR_L0BTB_Pos	6U				/*!< CACHE MHCR: L0BTB Position */
++#define CACHE_MHCR_L0BTB_Msk	(0x1UL << CACHE_MHCR_L0BTB_Pos)	/*!< CACHE MHCR: BTB Mask */
++
++#define CACHE_MHCR_BPE_Pos	5U				/*!< CACHE MHCR: BPE Position */
++#define CACHE_MHCR_BPE_Msk	(0x1UL << CACHE_MHCR_BPE_Pos)	/*!< CACHE MHCR: BPE Mask */
++
++#define CACHE_MHCR_RS_Pos	4U				/*!< CACHE MHCR: RS Position */
++#define CACHE_MHCR_RS_Msk	(0x1UL << CACHE_MHCR_RS_Pos)	/*!< CACHE MHCR: RS Mask */
++
++#define CACHE_MHCR_WB_Pos	3U				/*!< CACHE MHCR: WB Position */
++#define CACHE_MHCR_WB_Msk	(0x1UL << CACHE_MHCR_WB_Pos)	/*!< CACHE MHCR: WB Mask */
++
++#define CACHE_MHCR_WA_Pos	2U				/*!< CACHE MHCR: WA Position */
++#define CACHE_MHCR_WA_Msk	(0x1UL << CACHE_MHCR_WA_Pos)	/*!< CACHE MHCR: WA Mask */
++
++#define CACHE_MHCR_DE_Pos	1U				/*!< CACHE MHCR: DE Position */
++#define CACHE_MHCR_DE_Msk	(0x1UL << CACHE_MHCR_DE_Pos)	/*!< CACHE MHCR: DE Mask */
++
++#define CACHE_MHCR_IE_Pos	0U				/*!< CACHE MHCR: IE Position */
++#define CACHE_MHCR_IE_Msk	(0x1UL << CACHE_MHCR_IE_Pos)	/*!< CACHE MHCR: IE Mask */
++
++__ALWAYS_STATIC_INLINE uint64_t __get_MHCR(void)
++{
++	uint64_t result;
++
++	__ASM volatile("csrr %0, mhcr" : "=r"(result));
++	return result;
++}
++
++__ALWAYS_STATIC_INLINE void __set_MHCR(uint64_t mhcr)
++{
++	__ASM volatile("csrw mhcr, %0" : : "r"(mhcr));
++}
++
++/**
++ * \brief   Instruction Synchronization Barrier
++ * \details Instruction Synchronization Barrier flushes the pipeline in the processor,
++ *          so that all instructions following the ISB are fetched from cache or memory,
++ *          after the instruction has been completed.
++ */
++__ALWAYS_STATIC_INLINE void __ISB(void)
++{
++	/* fence.i; fence r, r */
++	asm volatile(".long 0x0000100f\n" ::: "memory");
++	asm volatile(".long 0x0220000f\n" ::: "memory");
++}
++
++/**
++ * \brief   Data Synchronization Barrier
++ * \details Acts as a special kind of Data Memory Barrier.
++ *          It completes when all explicit memory accesses before this instruction complete.
++ */
++__ALWAYS_STATIC_INLINE void __DSB(void)
++{
++	/* fence iorw, iorw */
++	asm volatile(".long 0x0ff0000f\n" ::: "memory");
++}
++
++__ALWAYS_STATIC_INLINE void __ICACHE_IALL(void)
++{
++	/* icache.iall */
++	asm volatile(".long 0x0100000b\n" ::: "memory");
++}
++
++__ALWAYS_STATIC_INLINE void __DCACHE_CIALL(void)
++{
++	/* dcache.ciall */
++	asm volatile(".long 0x0030000b\n" ::: "memory");
++}
++
++__STATIC_INLINE void csi_icache_enable(void)
++{
++#if (__ICACHE_PRESENT == 1U)
++	uint32_t cache;
++
++	__DSB();
++	__ISB();
++	__ICACHE_IALL();
++	cache = __get_MHCR();
++	cache |= CACHE_MHCR_IE_Msk;
++	__set_MHCR(cache);
++	__DSB();
++	__ISB();
++#endif
++}
++
++__STATIC_INLINE void csi_icache_disable(void)
++{
++#if (__ICACHE_PRESENT == 1U)
++	uint32_t cache;
++
++	__DSB();
++	__ISB();
++	cache = __get_MHCR();
++	cache &= ~CACHE_MHCR_IE_Msk;
++	__set_MHCR(cache);
++	__ICACHE_IALL();
++	__DSB();
++	__ISB();
++#endif
++}
++
++__STATIC_INLINE void csi_dcache_enable(void)
++{
++#if (__DCACHE_PRESENT == 1U)
++	uint32_t cache;
++
++	__DSB();
++	__ISB();
++	__DCACHE_CIALL();
++	cache = __get_MHCR();
++	cache |=
++		(CACHE_MHCR_DE_Msk | CACHE_MHCR_WB_Msk | CACHE_MHCR_WA_Msk |
++		 CACHE_MHCR_RS_Msk | CACHE_MHCR_BPE_Msk | CACHE_MHCR_L0BTB_Msk |
++		 CACHE_MHCR_IBPE_Msk | CACHE_MHCR_WBR_Msk);
++	__set_MHCR(cache);
++
++	__DSB();
++	__ISB();
++#endif
++}
++
++__STATIC_INLINE void csi_dcache_disable(void)
++{
++#if (__DCACHE_PRESENT == 1U)
++	register uint32_t cache;
++	__DSB();
++	__ISB();
++	cache = __get_MHCR();
++	cache &= ~(uint32_t)CACHE_MHCR_DE_Msk;
++	__set_MHCR(cache);
++	__DCACHE_CIALL();
++	__DSB();
++	__ISB();
++#endif
++}
++
++__STATIC_INLINE void csi_dcache_clean_invalid(void)
++{
++#if (__DCACHE_PRESENT == 1U)
++	__DSB();
++	__ISB();
++	__DCACHE_CIALL();
++	__DSB();
++	__ISB();
++#endif
++}
++
++void flush_dcache_all(void)
++{
++	csi_dcache_clean_invalid();
++}
++
++void flush_dcache_range(unsigned long start, unsigned long end)
++{
++	register unsigned long i asm("a0") = start &
++					     ~(CONFIG_SYS_CACHELINE_SIZE - 1);
++
++	for (; i < end; i += CONFIG_SYS_CACHELINE_SIZE)
++		asm volatile(".long 0x0295000b" :: "r"(i) : "memory"); /* dcache.cpa a0 */
++
++	asm volatile(".long 0x01b0000b"); /* T-HEAD sync.is */
++}
++
++void invalidate_dcache_range(unsigned long start, unsigned long end)
++{
++	register unsigned long i asm("a0") = start &
++					     ~(CONFIG_SYS_CACHELINE_SIZE - 1);
++
++	for (; i < end; i += CONFIG_SYS_CACHELINE_SIZE)
++		asm volatile(".long 0x02a5000b" :: "r"(i) : "memory"); /* dcache.ipa a0 */
++
++	asm volatile(".long 0x01b0000b"); /* T-HEAD sync.is */
++}
++
++void icache_enable(void)
++{
++#if !CONFIG_IS_ENABLED(SYS_ICACHE_OFF)
++	csi_icache_enable();
++#endif
++}
++
++void icache_disable(void)
++{
++#if !CONFIG_IS_ENABLED(SYS_ICACHE_OFF)
++	csi_icache_disable();
++#endif
++}
++
++void dcache_enable(void)
++{
++#if !CONFIG_IS_ENABLED(SYS_DCACHE_OFF)
++	csi_dcache_enable();
++#endif
++}
++
++void dcache_disable(void)
++{
++#if !CONFIG_IS_ENABLED(SYS_DCACHE_OFF)
++	csi_dcache_disable();
++#endif
++}
+diff --git a/arch/riscv/cpu/k230/config.mk b/arch/riscv/cpu/k230/config.mk
+new file mode 100644
+index 00000000..d9eab166
+--- /dev/null
++++ b/arch/riscv/cpu/k230/config.mk
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: GPL-2.0+
++# Copyright (c) 2026, Canaan Creative Co., Ltd.
++
++ifndef CONFIG_SPL_BUILD
++	ifndef  CONFIG_TARGET_K230_FPGA
++		ifdef CONFIG_SPL
++			# Attach the BootROM header only when tools/firmware_gen.py
++			# exists; without it only the plain u-boot.bin and
++			# u-boot-spl.bin are built, not flash-bootable images.
++			ifneq ($(wildcard $(srctree)/tools/firmware_gen.py),)
++				INPUTS-y += add_firmware_head
++			endif
++		endif
++	endif
++endif
++add_firmware_head: u-boot.bin spl/u-boot-spl.bin u-boot.img
++	# wrap SPL with K230 BootROM header
++	cp spl/u-boot-spl.bin  t.bin ; python3 $(srctree)/tools/firmware_gen.py  -i t.bin -o u-boot-spl-k230.bin -n
++	$(srctree)/tools/endian-swap.py   u-boot-spl-k230.bin  u-boot-spl-k230-swap.bin
++	# file name used by the image packaging scripts
++	cp u-boot-spl-k230.bin fn_u-boot-spl.bin
++
++	# compress U-Boot, prepend U-Boot header and firmware header
++	gzip -k -f u-boot.bin ;
++	# Keep the standard CM byte 0x08: SPL decompresses with the software
++	# gunzip in lib/gunzip.c (unzip.o is built only into U-Boot proper),
++	# which takes under 1 s for U-Boot. The HW UGZIP marker 0x09 is set
++	# only on the kernel image (fw_payload.bin.gz, in gen-spinand.sh).
++	./tools/mkimage -A riscv -O u-boot -C gzip -T firmware -a ${CONFIG_TEXT_BASE} -e ${CONFIG_TEXT_BASE} -n uboot -d  u-boot.bin.gz   u-boot.img
++	cp u-boot.img t.bin;python3 $(srctree)/tools/firmware_gen.py  -i  t.bin -o fn_u-boot.img -n
++	# file name used by the image packaging scripts
++	cp fn_u-boot.img fn_ug_u-boot.bin
++
++	# SPI-NAND boot area raw image (5 MB, covers
++	# uboot_spl_a/uboot_spl_b/uboot_a/uboot_b)
++	# layout (as in genimage-spinand.cfg):
++	#  0x000000  uboot_spl_a  512K
++	#  0x080000  uboot_spl_b  512K  (redundant)
++	#  0x100000  uboot_a      2M
++	#  0x300000  uboot_b      2M    (redundant)
++	rm -f spinand.img
++	dd if=/dev/zero of=spinand.img bs=1M count=5 status=none
++	dd if=fn_u-boot-spl.bin of=spinand.img bs=512 seek=$$((0x000000/512)) conv=notrunc status=none
++	dd if=fn_u-boot-spl.bin of=spinand.img bs=512 seek=$$((0x080000/512)) conv=notrunc status=none
++	dd if=fn_ug_u-boot.bin  of=spinand.img bs=512 seek=$$((0x100000/512)) conv=notrunc status=none
++	dd if=fn_ug_u-boot.bin  of=spinand.img bs=512 seek=$$((0x300000/512)) conv=notrunc status=none
++	@echo "==> SPI-NAND boot image: spinand.img (flash to SPI-NAND offset 0)"
++	@echo "==> individual: fn_u-boot-spl.bin (0x0/0x80000) + fn_ug_u-boot.bin (0x100000/0x300000)"
+diff --git a/arch/riscv/cpu/k230/ddr.sh b/arch/riscv/cpu/k230/ddr.sh
+new file mode 100755
+index 00000000..657daba8
+--- /dev/null
++++ b/arch/riscv/cpu/k230/ddr.sh
+@@ -0,0 +1,116 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0+
++# Copyright (c) 2026, Canaan Creative Co., Ltd.
++
++cat > ddr.awk  <<'EOF'
++#  data.c--data segment c-code array		inst.c----instruction c-code
++#  dmem.bin---data segment binary file;		imem.bin---instruction binary
++#  files.c---extract files and values, comparison file;
++
++BEGIN { print "wwwwwwwwwinstr---instruction--" > "files.c";}
++
++#instruction
++FNR >= isl && FNR <= iel &&  /reg_write/ && (! /^\s*\/\//) {
++	match($0, "[^+]*+ *(0x[0-f]*)[^,]*, *(0x[0-f]*)", ary);
++	print "//inst " $0 " " FNR " " ary[1] " " ary[2] >>"files.c";
++	instrction[ary[1]]=ary[2];
++}
++
++#data
++FNR >= dsl && FNR <=del  && /reg_write/ && (! /^\s*\/\//) {
++	match($0, "[^+]*+ *(0x[0-f]*)[^,]*, *(0x[0-f]*)", ary);
++	print "//data " $0 " "   FNR " " ary[1] " " ary[2] >>"files.c";
++	data[ary[1]]=ary[2];
++}
++
++END {
++	system("rm -rf it inst inst.c dt data data.c");
++	n=asorti(instrction, sorted)
++
++	for (i=1; i<=n; i++) {
++		if( (i>1) && ((strtonum(sorted[i])-strtonum(sorted[i-1])) !=1 )) {
++			printf ("instr 	error i=%d %s %s\n",i, sorted[i], sorted[i-1] );
++			exit 1;
++		}
++		printf ("%04x ",strtonum(instrction[sorted[i]]) ) >>"inst";
++		printf ("0x%04x,",strtonum(instrction[sorted[i]]) ) >>"inst.c";
++	}
++	system("xxd -r -p inst imem.bin");
++
++	n=asorti(data, sorted)
++	for (i=1; i<=n; i++) {
++		if( (i>1) && ((strtonum(sorted[i])-strtonum(sorted[i-1])) !=1 )) {
++			printf ("data error i=%d %s %s\n",i, sorted[i], sorted[i-1] );
++			exit 1;
++		}
++		printf ("%04x ",strtonum(data[sorted[i]]) )>>"data";
++		printf ("0x%04x,",strtonum(data[sorted[i]]) ) >>"data.c";
++	}
++	system("xxd -r -p data dmem.bin");
++}
++EOF
++
++f=$1
++df=$2
++isl_f=$3
++iel_f=$4
++dsl_f=$5
++del_f=$6
++
++#$3..$6: register offsets of the first and last reg_write() lines of the
++#instruction (isl, iel) and data (dsl, del) sections
++
++#get line numbers
++isl=$(grep $isl_f $f  -n | head -1 | cut  -d:  -f1);
++iel=$(grep $iel_f $f  -n | head -1 | cut  -d:  -f1);
++dsl=$(grep $dsl_f $f  -n | head -1 | cut  -d:  -f1);
++del=$(grep $del_f $f  -n | head -1 | cut  -d:  -f1);
++
++#convert to imem.bin dmem.bin
++set -e ; gawk -v isl=${isl}  -v iel=${iel} -v dsl=${dsl}  -v del=${del} -f ddr.awk  $f;
++cp $f $df;
++
++#replace with for-loop function;
++sed -i -e "${dsl},${del}d"  $df
++sed -i -e "${dsl}a ddr_wite_bin(DDR_REG_BASE+0x54000*4+0x02000000,gDdrD,ARRAY_SIZE(gDdrD));"  $df   ##data
++sed -i -e "${isl},${iel}d"  $df
++sed -i -e "${isl}a ddr_wite_bin(DDR_REG_BASE+0x50000*4+0x02000000,gDdrI,ARRAY_SIZE(gDdrI));"  $df  ##instruction
++
++cat > temp.c  <<EOF
++#include <asm/io.h>
++#include <linux/kernel.h>
++static const unsigned short gDdrI[]={
++	0x11111111,
++};
++static const unsigned short gDdrD[]={
++	0xdddddddd,
++};
++int  ddr_wite_bin(ulong regs,const unsigned short *bin,ulong blen)
++{
++	int i = 0;
++	for(i=0;i<blen;i++)
++	{
++		writel(*(bin+i), (volatile void __iomem *)(regs+i*4));
++	}
++
++	return 0;
++}
++EOF
++
++#instruction array
++tl=$(grep 0x11111111 temp.c  -n | cut  -d:  -f1);
++sed -i  -e "$tl d"   temp.c
++sed -i  -e "$(($tl-1)) r  inst.c"  temp.c
++#data array
++tl=$(grep 0xdddddddd temp.c  -n | cut  -d:  -f1);
++sed -i  -e "$tl d"   temp.c
++sed -i  -e "$(($tl-1)) r  data.c"  temp.c
++#update code and header file;
++sed -i -e "/0x98000000/ r temp.c"  $df
++
++rm -rf  dmem.c  imem.c  inst.c data.c   temp.c  data  inst
++
++#imem.bin--instruction bin file;
++#dmem.bin--data bin file;
++#files.c--- view the key values extracted earlier;
++rm -rf imem.bin  dmem.bin files.c  ddr.awk
+diff --git a/arch/riscv/cpu/k230/ddr_2d.sh b/arch/riscv/cpu/k230/ddr_2d.sh
+new file mode 100755
+index 00000000..0faef550
+--- /dev/null
++++ b/arch/riscv/cpu/k230/ddr_2d.sh
+@@ -0,0 +1,151 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0+
++# Copyright (c) 2026, Canaan Creative Co., Ltd.
++
++#usage: ddr_2d.sh <in> <out> <isl> <iel> <dsl> <del> <2d del>
++cat > ddr.awk  <<'EOF'
++BEGIN { print "wwwwwwwwwinstr---instruction--" > "files.c";}
++
++#instruction
++FNR >= isl && FNR <= iel &&  /reg_write/ && (! /^\s*\/\//) {
++	match($0, "[^+]*+ *(0x[0-f]*)[^,]*, *(0x[0-f]*)", ary);
++	print "//inst " $0 " " FNR " " ary[1] " " ary[2] >>"files.c";
++	instrction[ary[1]]=ary[2];
++}
++
++#data
++FNR >= dsl && FNR <=del  && /reg_write/ && (! /^\s*\/\//) {
++	match($0, "[^+]*+ *(0x[0-f]*)[^,]*, *(0x[0-f]*)", ary);
++	print "//data " $0 " "   FNR " " ary[1] " " ary[2] >>"files.c";
++	data[ary[1]]=ary[2];
++}
++
++END {
++	system("rm -rf it inst inst.c dt data data.c");
++	n=asorti(instrction, sorted)
++
++	for (i=1; i<=n; i++) {
++		if( (i>1) && ((strtonum(sorted[i])-strtonum(sorted[i-1])) !=1 )) {
++			printf ("instr 	error i=%d %s %s\n",i, sorted[i], sorted[i-1] );
++			exit 1;
++		}
++		printf ("%04x ",strtonum(instrction[sorted[i]]) ) >>"inst";
++		printf ("0x%04x,",strtonum(instrction[sorted[i]]) ) >>"inst.c";
++	}
++	system("xxd -r -p inst imem.bin");
++
++	n=asorti(data, sorted)
++	for (i=1; i<=n; i++) {
++		if( (i>1) && ((strtonum(sorted[i])-strtonum(sorted[i-1])) !=1 )) {
++			printf ("data error i=%d %s %s\n",i, sorted[i], sorted[i-1] );
++			exit 1;
++		}
++		printf ("%04x ",strtonum(data[sorted[i]]) )>>"data";
++		printf ("0x%04x,",strtonum(data[sorted[i]]) ) >>"data.c";
++	}
++	system("xxd -r -p data dmem.bin");
++}
++EOF
++
++f=$1
++df=$2
++isl_f=$3
++iel_f=$4
++dsl_f=$5
++del_f=$6
++
++isl_f_2d=$3
++iel_f_2d=$4
++dsl_f_2d=$5
++del_f_2d=$7
++
++#$3..$6: register offsets of the first and last reg_write() lines of the
++#instruction (isl, iel) and data (dsl, del) sections; $7: register offset of
++#the last data line of the 2D training section
++
++#get line numbers
++isl=$(grep $isl_f $f  -n | head -1 | cut  -d:  -f1);
++iel=$(grep $iel_f $f  -n | head -1 | cut  -d:  -f1);
++dsl=$(grep $dsl_f $f  -n | head -1 | cut  -d:  -f1);
++del=$(grep $del_f $f  -n | head -1 | cut  -d:  -f1);
++
++isl_2d=$(grep $isl_f_2d $f  -n | tail -1 | cut  -d:  -f1);
++iel_2d=$(grep $iel_f_2d $f  -n | tail -1 | cut  -d:  -f1);
++dsl_2d=$(grep $dsl_f_2d $f  -n | tail -1 | cut  -d:  -f1);
++del_2d=$(grep $del_f_2d $f  -n | tail -1 | cut  -d:  -f1);
++
++#convert to imem.bin dmem.bin
++set -e ; gawk -v isl=${isl_2d}  -v iel=${iel_2d} -v dsl=${dsl_2d}  -v del=${del_2d} -f ddr.awk  $f;
++cp inst.c  inst_2d.c
++cp data.c data_2d.c
++cp files.c files_2d.c
++cp imem.bin imem_2d.bin
++cp dmem.bin dmem_2d.bin
++set -e ; gawk -v isl=${isl}  -v iel=${iel} -v dsl=${dsl}  -v del=${del} -f ddr.awk  $f;
++cp $f $df;
++
++#replace with for-loop function;
++sed -i -e "${dsl_2d},${del_2d}d"  $df
++sed -i -e "${dsl_2d}a ddr_wite_bin(DDR_REG_BASE+0x54000*4+0x02000000,gDdrD_2d,ARRAY_SIZE(gDdrD_2d));"  $df   ##data
++sed -i -e "${isl_2d},${iel_2d}d"  $df
++sed -i -e "${isl_2d}a ddr_wite_bin(DDR_REG_BASE+0x50000*4+0x02000000,gDdrI_2d,ARRAY_SIZE(gDdrI_2d));"  $df  ##instruction
++
++sed -i -e "${dsl},${del}d"  $df
++sed -i -e "${dsl}a ddr_wite_bin(DDR_REG_BASE+0x54000*4+0x02000000,gDdrD,ARRAY_SIZE(gDdrD));"  $df   ##data
++sed -i -e "${isl},${iel}d"  $df
++sed -i -e "${isl}a ddr_wite_bin(DDR_REG_BASE+0x50000*4+0x02000000,gDdrI,ARRAY_SIZE(gDdrI));"  $df  ##instruction
++
++cat > temp.c  <<EOF
++#include <asm/io.h>
++#include <linux/kernel.h>
++static const unsigned short gDdrI[]={
++	0x11111111,
++};
++static const unsigned short gDdrD[]={
++	0xdddddddd,
++};
++static const unsigned short gDdrI_2d[]={
++	0x12121212,
++};
++static const unsigned short gDdrD_2d[]={
++	0xd2d2d2d2,
++};
++int  ddr_wite_bin(ulong regs,const unsigned short *bin,ulong blen)
++{
++	int i = 0;
++	for(i=0;i<blen;i++)
++	{
++		writel(*(bin+i), (volatile void __iomem *)(regs+i*4));
++	}
++
++	return 0;
++}
++EOF
++
++#instruction array
++tl=$(grep 0x12121212 temp.c  -n | cut  -d:  -f1);
++sed -i  -e "$tl d"   temp.c
++sed -i  -e "$(($tl-1)) r  inst_2d.c"  temp.c
++#data array
++tl=$(grep 0xd2d2d2d2 temp.c  -n | cut  -d:  -f1);
++sed -i  -e "$tl d"   temp.c
++sed -i  -e "$(($tl-1)) r  data_2d.c"  temp.c
++
++#instruction array
++tl=$(grep 0x11111111 temp.c  -n | cut  -d:  -f1);
++sed -i  -e "$tl d"   temp.c
++sed -i  -e "$(($tl-1)) r  inst.c"  temp.c
++#data array
++tl=$(grep 0xdddddddd temp.c  -n | cut  -d:  -f1);
++sed -i  -e "$tl d"   temp.c
++sed -i  -e "$(($tl-1)) r  data.c"  temp.c
++
++#update code and header file;
++sed -i -e "/0x98000000/ r temp.c"  $df
++
++rm -rf  dmem.c  imem.c  inst.c data.c   temp.c  data  inst
++
++#imem.bin--instruction bin file;
++#dmem.bin--data bin file;
++#files.c--- view the key values extracted earlier;
++rm -rf imem.bin  dmem.bin files.c  ddr.awk inst_2d.c  data_2d.c files_2d.c  imem_2d.bin dmem_2d.bin
+diff --git a/arch/riscv/cpu/k230/k230_compat.h b/arch/riscv/cpu/k230/k230_compat.h
+new file mode 100644
+index 00000000..f0113be9
+--- /dev/null
++++ b/arch/riscv/cpu/k230/k230_compat.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++/*
++ * Included in every K230 source file: provides the delay, vsprintf, log
++ * and time helpers those files use without including them, and K230_dbg.
++ */
++#ifndef _K230_COMPAT_H_
++#define _K230_COMPAT_H_
++
++#include <stdarg.h>
++#include <linux/types.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/string.h>
++#include <vsprintf.h>
++#include <command.h>
++#include <log.h>
++#include <time.h>
++#include <init.h>
++#include <env.h>
++#include <image.h>
++#include <stdio.h>
++
++/* The K230 sources use image_header_t for struct legacy_img_hdr. */
++#ifndef image_header_t
++typedef struct legacy_img_hdr image_header_t;
++#endif
++
++#ifndef DBGLV
++#define DBGLV 7
++#endif
++
++#define k230_log(level, fmt, ...)                   \
++	do {                                        \
++		if (DBGLV >= (level))               \
++			printf(fmt, ##__VA_ARGS__); \
++	} while (0)
++
++#define K230_dbg(fmt, ...) k230_log(7, fmt, ##__VA_ARGS__)
++
++#endif /* _K230_COMPAT_H_ */
+diff --git a/arch/riscv/cpu/k230/platform.h b/arch/riscv/cpu/k230/platform.h
+new file mode 100644
+index 00000000..96204e14
+--- /dev/null
++++ b/arch/riscv/cpu/k230/platform.h
+@@ -0,0 +1,176 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++#ifndef _CPU_PLATFORM_H_
++#define _CPU_PLATFORM_H_
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++/*****************************************************************************
++ * Device Specific Peripheral Registers structures
++ ****************************************************************************/
++
++#define __I	volatile const	/* 'read only' permissions      */
++#define __O	volatile	/* 'write only' permissions     */
++#define __IO	volatile	/* 'read / write' permissions   */
++
++/*****************************************************************************
++ * Memory Map
++ ****************************************************************************/
++
++#define _IO_(addr) (addr)
++
++#define USER_ALLOC_ADDR		(0x80230000U)
++#define PATCH_CODE_ADDR		(0x80250000U)
++#define FIRMWARE_HEAD_ADDR	(0x80230000U)
++#define FIRMWARE_CODE_ADDR	(0x80300000U)
++#define PLAINCODE_ADDR		(0x80300000U - 4) // |4B firmware version|
++#define CIPHERCODE_ADDR		(0x80380000U - 4)
++#define FIRMWARE_CODE_MAX_LEN	(512 * 1024)
++#define SRAM_START_ADDRESS	(0x80000000U)
++#define PLIC_BASE_ADDR		(0x0f00000000UL) /*!< PLIC Base Address */
++
++#define UART0_BASE_ADDR	(0x91400000U)
++#define UART1_BASE_ADDR	(0x91401000U)
++#define UART2_BASE_ADDR	(0x91402000U)
++#define UART3_BASE_ADDR	(0x91403000U)
++#define UART4_BASE_ADDR	(0x91404000U)
++
++#define SPI0_BASE_ADDR	(0x91584000U)
++#define SPI1_BASE_ADDR	(0x91582000U)
++#define SPI2_BASE_ADDR	(0x91583000U)
++
++/* I2C */
++#define I2C0_BASE_ADDR	(0x91405000U)
++#define I2C1_BASE_ADDR	(0x91406000U)
++#define I2C2_BASE_ADDR	(0x91407000U)
++#define I2C3_BASE_ADDR	(0x91408000U)
++#define I2C4_BASE_ADDR	(0x91409000U)
++
++/* IOMUX */
++#define IOMUX_BASE_ADDR (0x91105000U)
++
++/* TIMER */
++#define TIMER_BASE_ADDR (0x91105800U)
++
++/* WDT */
++#define WDT0_BASE_ADDR	(0x91106000U)
++#define WDT1_BASE_ADDR	(0x91106800U)
++
++/* USB */
++#define USB0_BASE_ADDR	(0x91500000U)
++#define USB1_BASE_ADDR	(0x91540000U)
++
++/* SDIO */
++#define SDIO0_BASE_ADDR	(0x91580000U)
++#define SDIO1_BASE_ADDR	(0x91581000U)
++
++/* SYSCTL */
++#define SYSCTL_CLK_BASE_ADDR	(0x91100000U)
++#define SYSCTL_BOOT_BASE_ADDR	(0x91102000U)
++#define SYSCTL_PWR_BASE_ADDR	(0x91103000U)
++#define SYSCTL_RST_BASE_ADDR	(0x91101000U)
++#define SYSCTL_STC_BASE_ADDR	(0x91108000U)
++
++/*ugzip*/
++#define GSDMA_CTRL_ADDR	0x80800000ULL
++#define UGZIP_BASE_ADDR	0x80808000ULL
++#define SDMA_CH_CFG	0x80800050ULL
++
++#define GPIO_BASE_ADDR0	(0x9140B000U)
++#define GPIO_BASE_ADDR1	(0x9140C000U)
++
++/* puf */
++#define PUFIOT_ADDR_START	0x91210000
++#define PUFIOT_MAP_SIZE		0x6000
++
++#define DMA_ADDR_OFFSET		0x000
++#define CRYPTO_ADDR_OFFSET	0x100
++#define SP38A_ADDR_OFFSET	0x200
++#define CMAC_ADDR_OFFSET	0x220
++#define SP38C_ADDR_OFFSET	0x240
++#define SP38D_ADDR_OFFSET	0x260
++#define SP38E_ADDR_OFFSET	0x280
++#define KWP_ADDR_OFFSET		0x300
++#define CHACHA_ADDR_OFFSET	0x400
++#define HMAC_HASH_ADDR_OFFSET	0x800
++#define KDF_ADDR_OFFSET		0x900
++#define SP90A_ADDR_OFFSET	0xB00
++#define KA_ADDR_OFFSET		0xC00
++#define PKC_ADDR_OFFSET		0x1000
++#define RT_ADDR_OFFSET		0x3000
++#define CDE_ADDR_OFFSET		0x4000
++
++#define OSPI_CS		(14)
++#define OSPI_CLK	(15)
++#define OSPI_D0		(16)
++#define OSPI_D1		(17)
++#define OSPI_D2		(18)
++#define OSPI_D3		(19)
++#define OSPI_D4		(20)
++#define OSPI_D5		(21)
++#define OSPI_D6		(22)
++#define OSPI_D7		(23)
++#define OSPI_DQS	(24)
++
++#define QSPI0_CS4	(50)
++#define QSPI0_CS3	(51)
++#define QSPI0_CS2	(60)
++#define QSPI0_CS1	(61)
++
++#define QSPI0_CONF0_CS0	(54)
++#define QSPI0_CONF0_CLK	(55)
++#define QSPI0_CONF0_D0	(56)
++#define QSPI0_CONF0_D1	(57)
++#define QSPI0_CONF0_D2	(58)
++#define QSPI0_CONF0_D3	(59)
++
++#define QSPI0_CONF1_CS0	(14)
++#define QSPI0_CONF1_CLK	(15)
++#define QSPI0_CONF1_D0	(16)
++#define QSPI0_CONF1_D1	(17)
++#define QSPI0_CONF1_D2	(18)
++#define QSPI0_CONF1_D3	(19)
++
++#define SD_CLK	(26)
++#define SD_CMD	(27)
++#define SD_D0	(28)
++#define SD_D1	(29)
++#define SD_D2	(30)
++#define SD_D3	(31)
++
++#define DEBUG_UART_TXD	(38)
++#define DEBUG_UART_RXD	(39)
++
++#define HS_REG_BASE	(0x91585000UL)
++#define SD0_CTRL	(HS_REG_BASE + 0x00)
++#define USB0_TEST_CTL0	(HS_REG_BASE + 0x70)
++#define USB0_TEST_CTL1	(HS_REG_BASE + 0x74)
++#define USB0_TEST_CTL2	(HS_REG_BASE + 0x78)
++#define USB0_TEST_CTL3	(HS_REG_BASE + 0x7c)
++#define USB0_TEST_CTL4	(HS_REG_BASE + 0x80)
++#define USB0_TEST_CTL5	(HS_REG_BASE + 0x84)
++#define USB0_TEST_CTL6	(HS_REG_BASE + 0x88)
++
++#define USB1_TEST_CTL0	(HS_REG_BASE + 0x90)
++#define USB1_TEST_CTL1	(HS_REG_BASE + 0x94)
++#define USB1_TEST_CTL2	(HS_REG_BASE + 0x98)
++#define USB1_TEST_CTL3	(HS_REG_BASE + 0x9c)
++#define USB1_TEST_CTL4	(HS_REG_BASE + 0xa0)
++#define USB1_TEST_CTL5	(HS_REG_BASE + 0xa4)
++#define USB1_TEST_CTL6	(HS_REG_BASE + 0xa8)
++
++#define REG_USB0_TEST_CTL2	REG32(USB0_TEST_CTL2)
++#define REG_USB0_TEST_CTL3	REG32(USB0_TEST_CTL3)
++#define REG_USB1_TEST_CTL3	REG32(USB1_TEST_CTL3)
++
++#define kendryte_enable_otg_phy() (REG_USB0_TEST_CTL2 |= 1)
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _CPU_PLATFORM_H_ */
+diff --git a/arch/riscv/cpu/k230/sysctl.c b/arch/riscv/cpu/k230/sysctl.c
+new file mode 100644
+index 00000000..ed52d0f3
+--- /dev/null
++++ b/arch/riscv/cpu/k230/sysctl.c
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++#include "sysctl.h"
++
++__weak sysctl_boot_mode_e sysctl_boot_get_boot_mode(void)
++{
++	switch (REG_SOC_BOOT_CTL & 0x3) { /*bit0~1*/
++	case 1:
++		return SYSCTL_BOOT_NANDFLASH;
++	case 2:
++		return SYSCTL_BOOT_SDIO0;
++	case 3:
++		return SYSCTL_BOOT_SDIO1;
++	case 0:
++	default:
++		return SYSCTL_BOOT_NORFLASH;
++	}
++}
+diff --git a/arch/riscv/cpu/k230/sysctl.h b/arch/riscv/cpu/k230/sysctl.h
+new file mode 100644
+index 00000000..91597469
+--- /dev/null
++++ b/arch/riscv/cpu/k230/sysctl.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++#ifndef __SYSCTL_H__
++#define __SYSCTL_H__
++
++#include "platform.h"
++#include <asm/io.h>
++#define REG32(REG) readl((const volatile void __iomem *)REG)
++typedef enum {
++	SYSCTL_BOOT_NORFLASH = 0,
++	SYSCTL_BOOT_NANDFLASH = 1,
++	SYSCTL_BOOT_SDIO0 = 2,
++	SYSCTL_BOOT_SDIO1 = 3,
++	SYSCTL_BOOT_MAX,
++} sysctl_boot_mode_e;
++
++#ifdef BUILD_FPGA
++#define DEFAULT_CPU0_CLK	(50 * MHz)
++#define DEFAULT_SDIO0_CCLK	(50 * MHz)
++#define DEFAULT_SDIO1_CCLK	(25 * MHz)
++#define DEFAULT_OSPI_CLK	(50 * MHz)
++#define DEFAULT_QSPI_CLK	(50 * MHz)
++#define DEFAULT_UART_CLK	(25 * MHz)
++#else
++#define DEFAULT_CPU0_CLK	(800 * MHz)
++#define DEFAULT_SDIO0_CCLK	(200 * MHz)
++#define DEFAULT_SDIO1_CCLK	(100 * MHz)
++#define DEFAULT_OSPI_CLK	(800 * MHz)
++#define DEFAULT_QSPI_CLK	(200 * MHz)
++#define DEFAULT_UART_CLK	(50 * MHz)
++#endif
++
++#define USB_RST_CTL	(SYSCTL_RST_BASE_ADDR + 0x3c)
++#define REG_USB_RST_CTL	REG32(USB_RST_CTL)
++
++#define SDC_RST_CTL	(SYSCTL_RST_BASE_ADDR + 0x34)
++#define REG_SDC_RST_CTL	REG32(SDC_RST_CTL)
++
++#define SPI_RST_CTL	(SYSCTL_RST_BASE_ADDR + 0x44)
++#define REG_SPI_RST_CTL	REG32(SPI_RST_CTL)
++
++#define LOSYS_RST_CTL		(SYSCTL_RST_BASE_ADDR + 0x24)
++#define REG_LOSYS_RST_CTL	REG32(LOSYS_RST_CTL)
++
++#define SEC_RST_CTL	(SYSCTL_RST_BASE_ADDR + 0x4c)
++#define REG_SEC_RST_CTL	REG32(SEC_RST_CTL)
++
++#define SOC_BOOT_CTL		(SYSCTL_BOOT_BASE_ADDR + 0x40)
++#define REG_SOC_BOOT_CTL	REG32(SOC_BOOT_CTL)
++
++extern sysctl_boot_mode_e sysctl_boot_get_boot_mode(void);
++#endif
+diff --git a/arch/riscv/cpu/k230/unzip.c b/arch/riscv/cpu/k230/unzip.c
+new file mode 100644
+index 00000000..23942f90
+--- /dev/null
++++ b/arch/riscv/cpu/k230/unzip.c
+@@ -0,0 +1,382 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++#include <stdio.h>
++#include "platform.h"
++#include <asm/io.h>
++#include <cpu_func.h>
++#include <command.h>
++#include <linux/delay.h>
++#include <malloc.h>
++#include <gzip.h>
++
++#define ZIP_LINE_SIZE	(128 * 1024)
++#define ZIP_RD_CH	DMA_CH_0
++#define ZIP_WR_CH	DMA_CH_1
++#define SRAM_RD_ADDR	(0x80280000) // mem --> sram
++#define SRAM_WR_ADDR	(0X80200000) // sram --> mem
++#define SDMA_CH_LENGTH	0x30
++
++typedef struct sdma_llt {
++	uint32_t reserved_0 : 28;
++	uint32_t dimension : 1;
++	uint32_t pause : 1;
++	uint32_t node_intr : 1;
++	uint32_t reserved : 1;
++
++	uint32_t src_addr;
++
++	uint32_t line_size;
++
++	uint32_t line_num : 16;
++	uint32_t line_space : 16;
++
++	uint32_t dst_addr;
++
++	uint32_t next_llt_addr;
++} sdma_llt_t;
++
++typedef enum DIMENSION {
++	DIMENSION1,
++	DIMENSION2,
++} sdma_dimension_e;
++
++struct ugzip_reg {
++	uint32_t	decomp_start;
++	uint32_t	gzip_src_size;
++	uint32_t	dma_out_size;
++	uint32_t	decomp_intstat;
++};
++
++typedef enum dma_ch {
++	DMA_CH_0 = 0,
++	DMA_CH_1 = 1,
++	DMA_CH_2 = 2,
++	DMA_CH_3 = 3,
++	DMA_CH_4 = 4,
++	DMA_CH_5 = 5,
++	DMA_CH_6 = 6,
++	DMA_CH_7 = 7,
++	DMA_CH_MAX,
++} dma_ch_t;
++
++typedef enum ugzip_rw {
++	UGZIP_RD = 0,
++	UGZIP_WR = 1,
++} ugzip_rw_e;
++
++typedef struct sdma_ch_cfg {
++	uint32_t	ch_ctl;
++	uint32_t	ch_status;
++	uint32_t	ch_cfg;
++	uint32_t	ch_usr_data;
++	uint32_t	ch_llt_saddr;
++	uint32_t	ch_current_llt;
++} sdma_ch_cfg_t;
++
++typedef struct gsdma_ctrl {
++	uint32_t	dma_ch_en;
++	uint32_t	dma_int_mask;
++	uint32_t	dma_int_stat;
++	uint32_t	dma_cfg;
++	uint32_t	reserved[11];
++	uint32_t	dma_weight;
++} gsdma_ctrl_t;
++
++sdma_llt_t *g_llt_list_w = NULL;
++sdma_llt_t *g_llt_list_r = NULL;
++static uint32_t *ugzip_llt_cal(uint8_t *addr, uint32_t length, ugzip_rw_e mode)
++{
++	int i;
++	uint32_t list_num;
++	sdma_llt_t *llt_list;
++
++	list_num = (length - 1) / ZIP_LINE_SIZE + 1;
++	llt_list = (sdma_llt_t *)malloc(sizeof(sdma_llt_t) * list_num);
++	if (NULL == llt_list) {
++		printf("malloc error =\n");
++		return NULL;
++	}
++
++	if (mode == UGZIP_RD)
++		g_llt_list_r = llt_list;
++	else
++		g_llt_list_w = llt_list;
++
++	memset(llt_list, 0, sizeof(sdma_llt_t) * list_num);
++	for (i = 0; i < list_num; i++) {
++		llt_list[i].dimension = DIMENSION1;
++		llt_list[i].pause = 0;
++		llt_list[i].node_intr = 0;
++
++		if (mode == UGZIP_RD) { /* from memory to sram */
++			llt_list[i].src_addr =
++				((uint32_t)(uint64_t)addr + ZIP_LINE_SIZE * i);
++			llt_list[i].dst_addr =
++				SRAM_RD_ADDR + (i % 2) * ZIP_LINE_SIZE;
++		} else if (mode == UGZIP_WR) { /* from sram to memory */
++			llt_list[i].src_addr =
++				SRAM_WR_ADDR + (i % 4) * ZIP_LINE_SIZE;
++			llt_list[i].dst_addr =
++				((uint32_t)(uint64_t)addr + ZIP_LINE_SIZE * i);
++		}
++
++		if (i == list_num - 1) {
++			llt_list[i].line_size = ZIP_LINE_SIZE;
++			llt_list[i].next_llt_addr = 0;
++		} else {
++			llt_list[i].line_size = ZIP_LINE_SIZE;
++			llt_list[i].next_llt_addr =
++				(uint32_t)(uint64_t)(&llt_list[i + 1]);
++		}
++	}
++
++	flush_dcache_range((uint64_t)llt_list,
++			   (uint64_t)llt_list + sizeof(sdma_llt_t) * list_num);
++
++	return (uint32_t *)llt_list;
++}
++
++static int ugzip_sdma_cfg(uint8_t ch, ugzip_rw_e mode, uint8_t *addr,
++			  uint32_t length)
++{
++	uint32_t unzip_list_add = 0;
++	struct sdma_ch_cfg *ch_cfg = (struct sdma_ch_cfg *)SDMA_CH_CFG;
++	struct gsdma_ctrl *gsct = (struct gsdma_ctrl *)GSDMA_CTRL_ADDR;
++	uint32_t int_stat;
++
++	/* stop channel */
++	writel(0x2, (volatile void *)((uint64_t)&ch_cfg->ch_ctl +
++				      ch * SDMA_CH_LENGTH));
++	{
++		/*
++		 * Bounded busy-wait: if SDMA is clock-gated/in-reset its status reg
++		 * reads as 0xff..ff and an unbounded loop hangs forever.
++		 */
++		uint32_t g;
++
++		for (g = 100000;
++		     g &&
++		     (0x1 &
++		      readl((volatile void *)((uint64_t)&ch_cfg->ch_status +
++					      ch * SDMA_CH_LENGTH)));
++		     g--)
++			;
++		if (!g)
++			printf("k230 ugzip: ch%u status stuck busy\n", ch);
++	}
++
++	int_stat = readl((volatile void *)&gsct->dma_ch_en);
++	writel(int_stat | 1 << ch, (volatile void *)&gsct->dma_ch_en); /* enable channel */
++
++	/* clear done, item and pause interrupts */
++	writel(0x111 << ch, (volatile void *)&gsct->dma_int_stat);
++	if (ch == ZIP_RD_CH) {
++		writel(0x1 << 10, (volatile void *)((uint64_t)&ch_cfg->ch_cfg +
++						    ch * SDMA_CH_LENGTH));
++	}
++	unzip_list_add = (uint32_t)(uint64_t)ugzip_llt_cal(addr, length, mode);
++	writel(unzip_list_add,
++	       (volatile void *)((uint64_t)&ch_cfg->ch_llt_saddr +
++				 ch * SDMA_CH_LENGTH));
++
++	/* start channel */
++	writel(0x1, (volatile void *)((uint64_t)&ch_cfg->ch_ctl +
++				      ch * SDMA_CH_LENGTH));
++	return 0;
++}
++
++int stand_gunzip(void *dst, int dstlen, unsigned char *src, unsigned long *lenp)
++{
++	int offset = gzip_parse_header(src, *lenp);
++
++	if (offset < 0)
++		return offset;
++
++	return zunzip(dst, dstlen, src, lenp, 1, offset);
++}
++
++int k230_priv_unzip(void *dst, int dstlen, unsigned char *src,
++		    unsigned long *lenp)
++{
++	struct ugzip_reg *pUgzipReg = (struct ugzip_reg *)UGZIP_BASE_ADDR;
++	struct sdma_ch_cfg *ch_cfg = (struct sdma_ch_cfg *)SDMA_CH_CFG;
++	struct gsdma_ctrl *gsct = (struct gsdma_ctrl *)GSDMA_CTRL_ADDR;
++
++	int ret = 3;
++	uint64_t stime = get_ticks();
++	/*
++	 * 100 ms at the 27 MHz mtimer: the HW UGZIP either completes fast or
++	 * never (SDMA may be unable to move data at this stage), so fail
++	 * quickly and leave the cost to the software fallback.
++	 */
++	uint64_t etime = stime + 2700000;
++	uint32_t int_stat, decomp_intstat;
++	volatile uint32_t *p_rest_reg = NULL;
++
++	printf("k230 hw unzip enter: src=%lx len=%lx dst=%lx dstlen=%x\n",
++	       (uint64_t)src, *lenp, (uint64_t)dst, (uint32_t)dstlen);
++
++	/*
++	 * Reset SDMA and UGZIP first: their state at entry is unknown (SPL may
++	 * have left them gated), so the first ugzip_sdma_cfg busy-wait can
++	 * hang. Bounded reset waits make this recoverable.
++	 */
++	{
++		volatile uint32_t *p;
++		uint32_t g;
++
++		p = (volatile uint32_t *)(0x91101000 + 0x54); /* SDMA reset */
++		writel(0x2, p);
++		for (g = 100000; g && !(readl(p) & BIT(29)); g--)
++			;
++		writel(BIT(29), p);
++		if (!g)
++			printf("k230 hw unzip: SDMA reset stuck\n");
++
++		p = (volatile uint32_t *)(0x91101000 + 0x5c); /* UGZIP reset */
++		writel(0x1, p);
++		for (g = 100000; g && !(readl(p) & BIT(31)); g--)
++			;
++		writel(BIT(31), p);
++		if (!g)
++			printf("k230 hw unzip: UGZIP reset stuck\n");
++	}
++
++	flush_dcache_range((uint64_t)src, (uint64_t)src + (uint64_t)*lenp);
++
++	writel(0x80000000, (volatile void *)&pUgzipReg->gzip_src_size);
++	/* config sdma */
++	ugzip_sdma_cfg(ZIP_RD_CH, UGZIP_RD, src, *lenp);
++	ugzip_sdma_cfg(ZIP_WR_CH, UGZIP_WR, dst, dstlen);
++
++	writel(0x51f, (volatile void *)0x91302310ULL); /* NOC bandwidth */
++
++	/* config ugzip */
++	writel(*lenp | (0x1 << 31), (volatile void *)&pUgzipReg->gzip_src_size);
++	writel(dstlen, (volatile void *)&pUgzipReg->dma_out_size);
++
++	writel(0x3, (volatile void *)&pUgzipReg->decomp_start);
++
++	do {
++		int_stat = readl((volatile void *)&gsct->dma_int_stat);
++		decomp_intstat =
++			readl((volatile void *)&pUgzipReg->decomp_intstat);
++		if (int_stat) {
++			if (int_stat & 0x111)
++				writel(0x111 << 0,
++				       (volatile void *)&gsct->dma_int_stat);
++
++			if (int_stat & 0x222)
++				writel(0x222,
++				       (volatile void *)&gsct->dma_int_stat);
++
++			if (int_stat & 0x2) {
++				if (((0x1 << 10) & decomp_intstat)) {
++					ret = 0;
++				} else {
++					ret = 1; /* CRC error */
++					printf("unzip crc error %x  int %x \n",
++					       decomp_intstat, int_stat);
++				}
++				break;
++			}
++		}
++
++		if (etime < get_ticks()) {
++			ret = 2;
++			writel(0x111 << 0,
++			       (volatile void *)&gsct->dma_int_stat);
++			writel(0x111 << 1,
++			       (volatile void *)&gsct->dma_int_stat);
++			break;
++		}
++	} while (1);
++
++	if (g_llt_list_r) {
++		free(g_llt_list_r);
++		g_llt_list_r = NULL;
++	}
++	if (g_llt_list_w) {
++		free(g_llt_list_w);
++		g_llt_list_w = NULL;
++	}
++
++	invalidate_dcache_range((uint64_t)dst, (uint64_t)dst + dstlen);
++
++	if (ret) {
++		uint32_t g;
++		/* reset SDMA, bounded: the block may be gated */
++		p_rest_reg = (volatile int *)(0x91101000 + 0x54);
++		writel(0x2, p_rest_reg);
++		for (g = 100000; g && !(readl(p_rest_reg) & BIT(29)); g--)
++			;
++		writel(BIT(29), p_rest_reg);
++
++		/* reset UGZIP, bounded */
++		p_rest_reg = (volatile int *)(0x91101000 + 0x5c);
++		writel(0x1, p_rest_reg);
++		for (g = 100000; g && !(readl(p_rest_reg) & BIT(31)); g--)
++			;
++		writel(BIT(31), p_rest_reg);
++	}
++	printf("k230 hw unzip: exit ret=%d\n", ret);
++	/*Restore sram mapping*/
++	writel(0, (volatile void *)&pUgzipReg->gzip_src_size);
++	writel(0, (volatile void *)((uint64_t)&ch_cfg->ch_cfg));
++	return ret;
++}
++
++int gunzip(void *dst, int dstlen, unsigned char *src, unsigned long *lenp)
++{
++	int ret = 0;
++	int temp = 0;
++
++	char *pcm = (char *)(src + 2);
++
++	if (*pcm == 0x09) { /* CM byte 0x09 marks a stream for the HW UGZIP */
++		*pcm = 0x08;
++		temp = le32_to_cpu(*(u32 *)(src + (*lenp) - 4));
++		if (temp > dstlen) {
++			printf("dest len error %x %x \n", temp, dstlen);
++			return -4;
++		}
++		ret = k230_priv_unzip(dst, temp, src, lenp);
++		if (ret == 0) {
++			*lenp = temp;
++			return 0;
++		}
++		/*
++		 * Keep CM at 0x08 so that gzip_parse_header() in stand_gunzip(),
++		 * which requires src[2] == DEFLATED, accepts the stream.
++		 */
++		printf("k230 HW unzip ret=%d, falling back to SW\n", ret);
++	}
++	K230_dbg("general gunzip ");
++	ret = stand_gunzip(dst, dstlen, src, lenp);
++	return ret;
++}
++
++static int do_unzip(struct cmd_tbl *cmdtp, int flag, int argc,
++		    char *const argv[])
++{
++	int ret = 0;
++	ulong src, des, slen, dlen;
++
++	if (argc < 4)
++		return CMD_RET_USAGE;
++
++	src = simple_strtol(argv[1], NULL, 0);
++	slen = simple_strtol(argv[2], NULL, 0);
++	des = simple_strtol(argv[3], NULL, 0);
++	dlen = le32_to_cpu(*(u32 *)(src + slen - 4));
++
++	ret = gunzip((void *)des, dlen, (unsigned char *)src, &slen);
++	printf("ret =%x s=%lx %lx d=%lx %lx \n", ret, src, slen, des, dlen);
++	return ret;
++}
++
++U_BOOT_CMD_COMPLETE(k230_unzip, 6, 1, do_unzip, "k230_unzip",
++		    "\n src slen dest dlen \n", NULL);
+-- 
+2.43.0
+

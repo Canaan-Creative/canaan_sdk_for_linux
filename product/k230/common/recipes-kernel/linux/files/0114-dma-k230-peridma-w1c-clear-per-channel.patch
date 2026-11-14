@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] dma: k230_peridma: clear only the serviced channel status
+
+PDMA_INT_STAT is write-1-to-clear and packs four status types for eight
+channels (PDONE bit ch, PITEM bit 8+ch, PPAUSE bit 16+ch, PTOUT bit
+24+ch). The interrupt handler and peridma_pchan_irq_clear() read the
+whole register, OR in the bits to clear and write the result back:
+
+    reg = ioread32(INT_STAT);
+    reg |= (clear << ch_id);      /* keeps every other channel's bits */
+    iowrite32(reg, INT_STAT);     /* W1C clears them too */
+
+The value written still carries the pending bits of the other channels,
+so it clears interrupts the driver never serviced. With two channels
+running at once, for example a UART transmit and an I2S transmit, a
+completion of one channel is lost when the other channel's interrupt is
+cleared, and a lost UART transmit completion stalls the transmit FIFO
+refill.
+
+Clear only the channel being handled: _pdma_chn_state_clear() returns
+the channel's own mask instead of OR-ing into the shared value, and
+irq_clear() masks the read value down to this channel's bits before the
+write.
+
+Upstream-Status: Pending
+---
+ drivers/dma/k230_peridma.c | 22 +++++++---------------
+ 1 file changed, 7 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/dma/k230_peridma.c b/drivers/dma/k230_peridma.c
+index 42239158d..1b505cc8a 100644
+--- a/drivers/dma/k230_peridma.c
++++ b/drivers/dma/k230_peridma.c
+@@ -331,7 +331,7 @@ static inline void peridma_pchan_irq_clear(struct k230_peridma_pchan *pchan)
+ 	u32 clear = PDONE_INT | PITEM_INT | PPAUSE_INT | PTOUT_INT;
+ 
+ 	reg = ioread32(pdev->base + PDMA_INT_STAT);
+-	reg |= (clear << ch_id);
++	reg &= (clear << ch_id);
+ 	iowrite32(reg, pdev->base + PDMA_INT_STAT);
+ }
+ 
+@@ -966,19 +966,10 @@ static void k230_peridma_issue_pending(struct dma_chan *dchan)
+ 	spin_unlock_irqrestore(&vchan->vchan.lock, flags);
+ }
+ 
+-static void _pdma_chn_state_clear(enum pdma_ch_e pdma_chn, u32 *int_state)
++static u32 _pdma_chn_state_clear(enum pdma_ch_e pdma_chn, u32 int_state)
+ {
+-	if (*int_state & (1 << pdma_chn))
+-		*int_state |= (PDONE_INT << pdma_chn);
+-
+-	if (*int_state & (1 << (8 + pdma_chn)))
+-		*int_state |= (PITEM_INT << pdma_chn);
+-
+-	if (*int_state & (1 << (16 + pdma_chn)))
+-		*int_state |= (PPAUSE_INT << pdma_chn);
+-
+-	if (*int_state & (1 << (24 + pdma_chn)))
+-		*int_state |= (PTOUT_INT << pdma_chn);
++	return int_state &
++	       ((PDONE_INT | PITEM_INT | PPAUSE_INT | PTOUT_INT) << pdma_chn);
+ }
+ 
+ static irqreturn_t k230_peridma_interrupt(int irq, void *dev_id)
+@@ -989,14 +980,15 @@ static irqreturn_t k230_peridma_interrupt(int irq, void *dev_id)
+ 	struct k230_peridma_hwdesc *hwdesc = NULL;
+ 	int i;
+ 	u32 ch_id;
++	u32 int_clear = 0;
+ 	u32 int_stat = 0;
+ 
+ 	int_stat = ioread32(priv->base + PDMA_INT_STAT);
+ 
+ 	for (i = 0; i < CH_NUM; i++) {
+ 		if ((int_stat >> i) & 0x1) {
+-			_pdma_chn_state_clear(i, &int_stat);
+-			iowrite32(int_stat, priv->base + PDMA_INT_STAT);
++			int_clear = _pdma_chn_state_clear(i, int_stat);
++			iowrite32(int_clear, priv->base + PDMA_INT_STAT);
+ 			g_pdma_llt_list[i].use = false;
+ 		} else {
+ 			continue;
+-- 
+2.43.0
+

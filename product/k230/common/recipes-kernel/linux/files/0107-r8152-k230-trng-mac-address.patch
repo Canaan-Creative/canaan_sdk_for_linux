@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] r8152: use the k230 trng for a missing mac address
+
+When the adapter has no valid MAC address, build one from the Realtek
+OUI 00:e0:4c and three bytes read from the K230 true random number
+generator at 0x91213300 instead of a random locally administered
+address.
+
+Upstream-Status: Pending
+---
+ drivers/net/usb/r8152.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/usb/r8152.c b/drivers/net/usb/r8152.c
+index 127b34dcc..497d37b43 100644
+--- a/drivers/net/usb/r8152.c
++++ b/drivers/net/usb/r8152.c
+@@ -1808,8 +1808,17 @@ static int determine_ethernet_addr(struct r8152 *tp, struct sockaddr *sa)
+ 	} else if (!is_valid_ether_addr(sa->sa_data)) {
+ 		netif_err(tp, probe, dev, "Invalid ether addr %pM\n",
+ 			  sa->sa_data);
+-		eth_hw_addr_random(dev);
+-		ether_addr_copy(sa->sa_data, dev->dev_addr);
++		void __iomem *trng_addr = ioremap(0x91213300, 0x100);
++		unsigned int trng_data = readl(trng_addr);
++
++		iounmap(trng_addr);
++		char mac_addr_hex[6] = {
++			0x00, 0xe0, 0x4c,
++			trng_data & 0xff,
++			(trng_data >> 8) & 0xff,
++			(trng_data >> 16) & 0xff
++		};
++		ether_addr_copy(sa->sa_data, mac_addr_hex);
+ 		netif_info(tp, probe, dev, "Random ether addr %pM\n",
+ 			   sa->sa_data);
+ 		return 0;
+-- 
+2.43.0
+

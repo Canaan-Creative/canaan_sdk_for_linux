@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] drivers: build the canaan ws2812 driver
+
+Source drivers/canaan-ws2812/Kconfig and descend into
+drivers/canaan-ws2812/ when CANAAN_I2S_WS2812 is set.
+
+Upstream-Status: Pending
+---
+ drivers/Kconfig  | 2 ++
+ drivers/Makefile | 1 +
+ 2 files changed, 3 insertions(+)
+
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index 55127edf7..1c32eca2c 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -245,4 +245,6 @@ source "drivers/cdx/Kconfig"
+ 
+ source "drivers/canaan-hwtimer/Kconfig"
+ 
++source "drivers/canaan-ws2812/Kconfig"
++
+ endmenu
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 01039a1b2..0cdd218f3 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -200,3 +200,4 @@ obj-$(CONFIG_CDX_BUS)		+= cdx/
+ obj-$(CONFIG_CANAAN_HWTIMER)	+= canaan-hwtimer/
+ 
+ obj-$(CONFIG_S390)		+= s390/
++obj-$(CONFIG_CANAAN_I2S_WS2812)	+= canaan-ws2812/
+-- 
+2.43.0
+

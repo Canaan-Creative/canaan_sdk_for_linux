@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] fbdev: create the display at 240x240
+
+lv_display_create() initializes the default theme, which picks its size
+class (padding, radius) from the horizontal resolution at that moment.
+lv_linux_fbdev_set_file() later sets the framebuffer's real resolution
+but does not re-pick the class. Creating the display at the panel's
+240x240 selects the small class that matches the ST7789V.
+
+Upstream-Status: Pending
+
+--- a/src/drivers/display/fb/lv_linux_fbdev.c
++++ b/src/drivers/display/fb/lv_linux_fbdev.c
+@@ -102,7 +102,7 @@
+     LV_ASSERT_MALLOC(dsc);
+     if(dsc == NULL) return NULL;
+ 
+-    lv_display_t * disp = lv_display_create(800, 480);
++    lv_display_t * disp = lv_display_create(240, 240);
+     if(disp == NULL) {
+         lv_free(dsc);
+         return NULL;

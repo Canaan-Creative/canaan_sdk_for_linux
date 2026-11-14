@@ -1,0 +1,5 @@
+{"format": "1.0", "manufacturer": "canaan", "product": "Test",
+ "mainctroler": "k230", "hw": "HW", "sw": "SW", "totalbins": 1,
+ "upgrade_type": "OTA",
+ "files": [{"name": "app", "path": "aup-package.bin",
+            "partofst": "0x0", "partsize": "0x1000"}]}

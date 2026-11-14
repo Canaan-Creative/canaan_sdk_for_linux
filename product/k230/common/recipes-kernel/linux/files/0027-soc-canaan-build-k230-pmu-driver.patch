@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] soc: canaan: build the k230 pmu driver
+
+Add SOC_K230_PMU and build k230-pmu.o when it is set.
+
+Upstream-Status: Pending
+---
+ drivers/soc/canaan/Kconfig  | 10 ++++++++++
+ drivers/soc/canaan/Makefile |  1 +
+ 2 files changed, 11 insertions(+)
+
+diff --git a/drivers/soc/canaan/Kconfig b/drivers/soc/canaan/Kconfig
+index 0565c36..c506346 100644
+--- a/drivers/soc/canaan/Kconfig
++++ b/drivers/soc/canaan/Kconfig
+@@ -21,3 +21,13 @@ config SOC_K230_PM_DOMAINS
+ 	  power domains controller that is used for disabling and
+ 	  enabling SoC devices including CPU1, KPU, display, VPU
+ 	  and DPU.
++
++config SOC_K230_PMU
++	bool "Canaan Kendryte K230 PMU power key"
++	depends on RISCV && OF && ARCH_CANAAN
++	depends on INPUT=y
++	help
++	  This enables the Canaan Kendryte K230 power management unit
++	  driver. It programs the power key force power-down, power
++	  event and debounce counts from the device tree and reports a
++	  power event as a KEY_POWER press on the pmu_input device.
+diff --git a/drivers/soc/canaan/Makefile b/drivers/soc/canaan/Makefile
+index 1cd74cc..651070f 100644
+--- a/drivers/soc/canaan/Makefile
++++ b/drivers/soc/canaan/Makefile
+@@ -2,3 +2,4 @@
+ 
+ obj-$(CONFIG_SOC_K210_SYSCTL)	+= k210-sysctl.o
+ obj-$(CONFIG_SOC_K230_PM_DOMAINS)	+= k230-power-domains.o
++obj-$(CONFIG_SOC_K230_PMU)	+= k230-pmu.o
+-- 
+2.43.0
+

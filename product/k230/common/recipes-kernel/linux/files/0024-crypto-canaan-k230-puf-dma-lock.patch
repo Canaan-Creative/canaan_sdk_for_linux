@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] crypto: canaan: add the k230 puf dma lock
+
+The K230 AES and hash engines share the PUF DMA channel at 0x91210000.
+kendryte-puf provides a mutex that a driver holds across every
+programming sequence that touches it.
+
+Upstream-Status: Pending
+---
+ drivers/crypto/canaan/kendryte-puf.c | 26 ++++++++++++++++++++++++++
+ drivers/crypto/canaan/kendryte-puf.h | 17 +++++++++++++++++
+ 2 files changed, 43 insertions(+)
+ create mode 100644 drivers/crypto/canaan/kendryte-puf.c
+ create mode 100644 drivers/crypto/canaan/kendryte-puf.h
+
+diff --git a/drivers/crypto/canaan/kendryte-puf.c b/drivers/crypto/canaan/kendryte-puf.c
+new file mode 100644
+index 000000000..843633177
+--- /dev/null
++++ b/drivers/crypto/canaan/kendryte-puf.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++#include <linux/module.h>
++#include <linux/mutex.h>
++
++#include "kendryte-puf.h"
++
++static DEFINE_MUTEX(kendryte_puf_mutex);
++
++void kendryte_puf_lock(void)
++{
++	mutex_lock(&kendryte_puf_mutex);
++}
++EXPORT_SYMBOL_GPL(kendryte_puf_lock);
++
++void kendryte_puf_unlock(void)
++{
++	mutex_unlock(&kendryte_puf_mutex);
++}
++EXPORT_SYMBOL_GPL(kendryte_puf_unlock);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("CANAAN K230 PUF DMA channel lock");
+diff --git a/drivers/crypto/canaan/kendryte-puf.h b/drivers/crypto/canaan/kendryte-puf.h
+new file mode 100644
+index 000000000..6705548b5
+--- /dev/null
++++ b/drivers/crypto/canaan/kendryte-puf.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++/*
++ * The K230 AES and hash engines share one PUF DMA channel at 0x91210000.
++ * A driver holds this lock across every programming sequence that touches
++ * it.
++ */
++#ifndef __KENDRYTE_PUF_H__
++#define __KENDRYTE_PUF_H__
++
++void kendryte_puf_lock(void);
++void kendryte_puf_unlock(void);
++
++#endif /* __KENDRYTE_PUF_H__ */
+-- 
+2.43.0
+

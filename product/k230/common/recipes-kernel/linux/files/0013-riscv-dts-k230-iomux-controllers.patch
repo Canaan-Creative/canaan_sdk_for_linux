@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: add the iomux pin controllers
+
+Describe the two K230 IOMUX instances, the main one at 0x91105000 and
+the PMU one at 0x91000080, both clocked from iomux_pclk_gate, and
+include the pin constants header so that board files can write pin
+group nodes.
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/k230.dtsi | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+index 8ed85bd12..f414f721c 100644
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -1,10 +1,12 @@
+ // SPDX-License-Identifier: GPL-2.0 OR MIT
+ /*
+  * Copyright (C) 2024 Yangyu Chen <cyy@cyyself.name>
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
+  */
+ 
+ #include <dt-bindings/interrupt-controller/irq.h>
+ #include <dt-bindings/soc/canaan,k230_pm_domains.h>
++#include <dt-bindings/pinctrl/canaan,k230-iomux.h>
+ #include <dt-bindings/reset/canaan-k230-reset.h>
+ #include <dt-bindings/gpio/gpio.h>
+ 
+@@ -852,6 +854,24 @@ otp: otp@91213500 {
+ 				reg = <0x0 0x91213500 0x0 0x300>;
+ 			};
+ 		};
++
++		iomux: iomux@91105000 {
++			compatible = "canaan,k230-iomux";
++			reg = <0x0 0x91105000 0x0 0x100>;
++			#pinctrl-cells = <1>;
++			clocks = <&iomux_pclk_gate>;
++			clock-names = "apb";
++			status = "okay";
++		};
++
++		pmuiomux: pmuiomux@91000080 {
++			compatible = "canaan,k230-iomux";
++			reg = <0x0 0x91000080 0x0 0x20>;
++			#pinctrl-cells = <1>;
++			clocks = <&iomux_pclk_gate>;
++			clock-names = "apb";
++			status = "okay";
++		};
+ 	};
+ };
+ #include "k230_clock_provider.dtsi"
+-- 
+2.43.0
+

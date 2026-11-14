@@ -1,0 +1,75 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026, Canaan Creative Co., Ltd.
+#
+# For the licensing terms, see the LICENSE file (MIT License).
+#
+# NO WARRANTY. The Software is provided "AS IS", without warranty of any kind, express or
+# implied, including but not limited to the warranties of merchantability, fitness for a
+# particular purpose and non-infringement. In no event shall the authors or copyright
+# holders be liable for any claim, damages or other liability arising from, out of or in
+# connection with the Software or the use or other dealings in the Software.
+
+set -euo pipefail
+
+if [ $# -lt 2 ] || [ $# -gt 3 ]
+then
+    echo "./mmupgrade <file.aup> <ip> [password]"
+    echo "\$MMUPGRADE_PASS: password (preferred over the argument)"
+    echo "\$MMUPGRADE_USER: web user (default admin)"
+    exit 1
+fi
+
+aup=$1
+ip=$2
+pass=${3:-${MMUPGRADE_PASS:-}}
+user=${MMUPGRADE_USER:-admin}
+
+json_str()
+{
+    local s=$1 out='' c i
+
+    for ((i = 0; i < ${#s}; i++))
+    do
+        c=${s:i:1}
+        case $c in
+        \\ | \") out+="\\$c" ;;
+        $'\t') out+='\t' ;;
+        $'\n') out+='\n' ;;
+        $'\r') out+='\r' ;;
+        [$'\x01'-$'\x1f']) out+=$(printf '\\u%04x' "'$c") ;;
+        *) out+=$c ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+reply_msg()
+{
+    local re='"Msg":"([^"]*)"'
+
+    if [[ $1 =~ $re ]]
+    then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+reply=$(printf '{"command":"token","user":"%s","password":"%s"}' \
+    "$(json_str "$user")" "$(json_str "$pass")" |
+    curl -sS -k -H 'Content-Type: application/json' --data-binary @- \
+        "https://${ip}:8443/api/v1/token")
+re='"Token":"([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"'
+if ! [[ $reply =~ $re ]] || [ ${#BASH_REMATCH[1]} -gt 1023 ]
+then
+    reply_msg "$reply"
+    exit 1
+fi
+
+start=$(date +%s)
+reply=$(printf 'header = "Token: %s"\n' "${BASH_REMATCH[1]}" |
+    curl -K - -k --progress-bar -F "file=@${aup}" "https://${ip}:8443/api/v1/upgrade")
+reply_msg "$reply"
+echo "consume time: $(( $(date +%s) - start )) S"
+[[ $reply == *"Upgrade ok("* ]]

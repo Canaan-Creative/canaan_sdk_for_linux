@@ -1,0 +1,53 @@
+{
+    "format": "1.0",
+    "manufacturer": "canaan",
+    "product": "Nano3s",
+    "mainctroler": "k230",
+    "hw": "CONFIG_IMG_HW",
+    "sw": "CONFIG_IMG_SW",
+    "totalbins": 5,
+    "upgrade_type": "OTA",
+
+    "files": [
+        {
+            "name": "uboot",
+            "path": "linux/uboot/fn_ug_u-boot.bin",
+            "partofst": "0x100000",
+            "partsize": "0x200000",
+            "partofst2": "0x300000",
+            "partsize2": "0x200000"
+        },
+        {
+            "name": "uboot_env",
+            "path": "linux/uboot/spinand.env",
+            "partofst": "0x500000",
+            "partsize": "0x80000",
+            "partofst2": "0x580000",
+            "partsize2": "0x80000"
+        },
+        {
+            "name": "linux",
+            "path": "linux/linux_system.bin",
+            "partofst": "0xe00000",
+            "partsize": "0x800000",
+            "partofst2": "0x1600000",
+            "partsize2": "0x800000"
+        },
+        {
+            "name": "rootfs",
+            "path": "rootfs.ubi",
+            "partofst": "0x1e00000",
+            "partsize": "0x3000000",
+            "partofst2": "0x4e00000",
+            "partsize2": "0x3000000"
+        },
+        {
+            "name": "app",
+            "path": "app.ubi",
+            "partofst": "0x7e00000",
+            "partsize": "0xe00000",
+            "partofst2": "0x8c00000",
+            "partsize2": "0xe00000"
+        }
+    ]
+}

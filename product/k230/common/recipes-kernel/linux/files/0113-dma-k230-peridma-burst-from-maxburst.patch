@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] dma: k230_peridma: derive the device burst from maxburst
+
+Program a 16-beat device burst when the slave configuration asks for a
+maxburst of 16 or more in the transfer direction, and an 8-beat burst
+otherwise. Clients that do not set a larger maxburst keep the 8-beat
+burst.
+
+Upstream-Status: Pending
+---
+ drivers/dma/k230_peridma.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/dma/k230_peridma.c b/drivers/dma/k230_peridma.c
+index 96ac412bc..42239158d 100644
+--- a/drivers/dma/k230_peridma.c
++++ b/drivers/dma/k230_peridma.c
+@@ -480,7 +480,11 @@ generate_hwdesc(struct k230_peridma_vchan *vchan, dma_addr_t src,
+ 		hwdesc->usr_pdma_chn_cfg.pdma_ch_cfg.ch_dev_hsize = hsize;
+ 	}
+ 	hwdesc->usr_pdma_chn_cfg.pdma_ch_cfg.ch_dat_endian = 0;
+-	hwdesc->usr_pdma_chn_cfg.pdma_ch_cfg.ch_dev_blen = PBURST_LEN_8;
++	if ((dir == DMA_MEM_TO_DEV ? sconfig->dst_maxburst :
++				     sconfig->src_maxburst) >= 16)
++		hwdesc->usr_pdma_chn_cfg.pdma_ch_cfg.ch_dev_blen = PBURST_LEN_16;
++	else
++		hwdesc->usr_pdma_chn_cfg.pdma_ch_cfg.ch_dev_blen = PBURST_LEN_8;
+ 	hwdesc->usr_pdma_chn_cfg.pdma_ch_cfg.ch_priority = vchan->priority;
+ 	hwdesc->usr_pdma_chn_cfg.pdma_ch_cfg.ch_dev_tout = vchan->dev_tout;
+ 
+-- 
+2.43.0
+

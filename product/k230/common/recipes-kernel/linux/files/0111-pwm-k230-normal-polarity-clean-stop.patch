@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] pwm: k230: support normal polarity and stop on a period end
+
+Rework enable and disable in the atomic driver:
+
+ - Normal polarity by software inversion (cmp = pwmcmp0 - pulse),
+   reported by get_state. Inversed polarity is not required.
+ - update_period() programs ZERO_CMP and the scale but does not set
+   EN_ALWAYS.
+ - k230_pwm_init() writes no PWM register at probe. Writing pwmcmp at
+   probe clicks a passive buzzer.
+ - apply() drives the enable bits as follows:
+     enable : clear EN_ONCE, set EN_ALWAYS after programming the compare
+     disable: set EN_ONCE, clear EN_ALWAYS, leave the compare untouched
+   EN_ONCE makes the counter finish the current period and stop at a
+   clean boundary (count 0) instead of freezing mid-cycle, which leaves
+   a DC step that clicks a buzzer on stop and a random start phase that
+   clicks on the next start. The disable sequence runs only when the
+   channel is running (EN_ALWAYS set). On a stopped block, setting
+   EN_ONCE would fire a spurious one-shot period, for example at
+   pwm-beeper probe, which issues a disabled apply.
+ - The channels of a block share PWMCFG. Disabling one channel while
+   another is enabled programs the 0% duty compare for that channel and
+   leaves the block running; the stop sequence runs only for the last
+   enabled channel. The PWMCFG read-modify-write runs under the lock.
+
+Upstream-Status: Pending
+---
+ drivers/pwm/pwm-k230.c | 83 +++++++++++++++++++++++++++++++-----------
+ 1 file changed, 65 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/pwm/pwm-k230.c b/drivers/pwm/pwm-k230.c
+index 3dee24980..e206d8013 100644
+--- a/drivers/pwm/pwm-k230.c
++++ b/drivers/pwm/pwm-k230.c
+@@ -57,6 +57,7 @@ struct k230_pwm_chip {
+ 	struct clk *clk;
+ 	struct mutex lock;
+ 	u8 user_count;
++	u8 enabled;
+ 	u8 scale;
+ 	u64 period;
+ 	u64 clk_freq;
+@@ -84,6 +85,7 @@ static void k230_pwm_free(struct pwm_chip *chip, struct pwm_device *pwm)
+ 
+ 	mutex_lock(&priv->lock);
+ 	priv->user_count--;
++	priv->enabled &= ~BIT(pwm->hwpwm);
+ 	if (priv->user_count == 0)
+ 		writel(0, priv->regs + PWM_PWMCFG);
+ 	mutex_unlock(&priv->lock);
+@@ -91,18 +93,15 @@ static void k230_pwm_free(struct pwm_chip *chip, struct pwm_device *pwm)
+ 
+ static void k230_pwm_init(struct k230_pwm_chip *priv)
+ {
+-	u64 val;
+-
+ 	mutex_init(&priv->lock);
+ 	priv->clk_freq = clk_get_rate(priv->clk);
+ 
+-	val = readl(priv->regs + PWM_PWMCFG);
+-	if ((val & PWM_PWMCFG_EN_ALWAYS) == 0) {
+-		writel(1, priv->regs + PWM_PWMCMP(0));
+-		writel(0, priv->regs + PWM_PWMCMP(1));
+-		writel(0, priv->regs + PWM_PWMCMP(2));
+-		writel(0, priv->regs + PWM_PWMCMP(3));
+-	}
++	/*
++	 * The PWM registers are programmed on first use by
++	 * k230_pwm_update_period() and k230_pwm_apply(). Writing pwmcmp at
++	 * probe drives an edge on the muxed output pin, which clicks a
++	 * passive buzzer while the driver loads.
++	 */
+ }
+ 
+ static void k230_pwm_update_period(struct k230_pwm_chip *priv)
+@@ -117,8 +116,11 @@ static void k230_pwm_update_period(struct k230_pwm_chip *priv)
+ 		val = 1;
+ 	writel(val, priv->regs + PWM_PWMCMP(0));
+ 
+-	val = PWM_PWMCFG_EN_ALWAYS | PWM_PWMCFG_ZERO_CMP |
+-	      FIELD_PREP(PWM_PWMCFG_SCALE, scale);
++	/*
++	 * The counter is not started here: k230_pwm_apply() drives
++	 * EN_ALWAYS and EN_ONCE from state->enabled.
++	 */
++	val = PWM_PWMCFG_ZERO_CMP | FIELD_PREP(PWM_PWMCFG_SCALE, scale);
+ 	writel(val, priv->regs + PWM_PWMCFG);
+ 	priv->scale = scale;
+ }
+@@ -137,9 +139,13 @@ static int k230_pwm_get_state(struct pwm_chip *chip, struct pwm_device *pwm,
+ 		duty = period;
+ 
+ 	*state = pwm->state;
+-	state->polarity = PWM_POLARITY_INVERSED;
++	/*
++	 * K230 PWM is natively inverted; present it as NORMAL by
++	 * reporting the active-high time (period - cmp).
++	 */
++	state->polarity = PWM_POLARITY_NORMAL;
+ 	state->period = (period << scale) * NSEC_PER_SEC / freq;
+-	state->duty_cycle = (duty << scale) * NSEC_PER_SEC / freq;
++	state->duty_cycle = ((period - duty) << scale) * NSEC_PER_SEC / freq;
+ 
+ 	return 0;
+ }
+@@ -149,14 +155,10 @@ static int k230_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
+ {
+ 	struct k230_pwm_chip *priv = k230_pwm_from_chip(chip);
+ 	u64 val, duty, period, freq;
+-
+-	if (state->polarity != PWM_POLARITY_INVERSED)
+-		return -EINVAL;
++	u32 cfg;
+ 
+ 	period = state->period;
+ 	duty = state->duty_cycle;
+-	if (!state->enabled)
+-		duty = 0;
+ 
+ 	mutex_lock(&priv->lock);
+ 	if (period != priv->period) {
+@@ -169,12 +171,57 @@ static int k230_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
+ 	}
+ 	mutex_unlock(&priv->lock);
+ 
++	mutex_lock(&priv->lock);
++	cfg = readl(priv->regs + PWM_PWMCFG);
++
++	if (!state->enabled) {
++		priv->enabled &= ~BIT(pwm->hwpwm);
++		if (priv->enabled) {
++			val = state->polarity != PWM_POLARITY_INVERSED ?
++			      readl(priv->regs + PWM_PWMCMP(0)) : 0;
++			writel(val, priv->regs + PWM_PWMCMP(pwm->hwpwm + 1));
++			mutex_unlock(&priv->lock);
++			return 0;
++		}
++		/*
++		 * EN_ONCE without EN_ALWAYS lets a running channel finish its
++		 * current period and stop at count 0 instead of freezing
++		 * mid-cycle, which leaves a DC step that clicks a buzzer. On a
++		 * stopped block EN_ONCE fires a spurious one-shot period, so
++		 * act only while EN_ALWAYS is set. The compare is left
++		 * untouched.
++		 */
++		if (cfg & PWM_PWMCFG_EN_ALWAYS) {
++			cfg |= PWM_PWMCFG_EN_ONCE;
++			cfg &= ~PWM_PWMCFG_EN_ALWAYS;
++			writel(cfg, priv->regs + PWM_PWMCFG);
++		}
++		mutex_unlock(&priv->lock);
++		return 0;
++	}
++
+ 	freq = priv->clk_freq;
+ 	val = div64_ul(duty * freq, NSEC_PER_SEC);
+ 	val = val >> priv->scale;
+ 	val = min(val, (1U << PWM_CMPWIDTH) - 1);
++	/*
++	 * NORMAL: cmp = pwmcmp0 - pulse (SW inversion).
++	 * INVERSED keeps the raw active-low compare.
++	 */
++	if (state->polarity != PWM_POLARITY_INVERSED) {
++		u64 pcmp = readl(priv->regs + PWM_PWMCMP(0));
++
++		val = (val >= pcmp) ? 0 : (pcmp - val);
++	}
+ 	writel(val, priv->regs + PWM_PWMCMP(pwm->hwpwm + 1));
+ 
++	/* The compare is programmed before the counter starts. */
++	cfg &= ~PWM_PWMCFG_EN_ONCE;
++	cfg |= PWM_PWMCFG_EN_ALWAYS;
++	writel(cfg, priv->regs + PWM_PWMCFG);
++	priv->enabled |= BIT(pwm->hwpwm);
++	mutex_unlock(&priv->lock);
++
+ 	return 0;
+ }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: add the pmu node
+
+Describe the K230 power management unit at 0x91000000, PLIC interrupt
+175, disabled by default. Its registers are given as two ranges that
+leave out the pmuiomux pin controller at 0x91000080.
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/k230.dtsi | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+index 50a17fb..a3394f3 100644
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -453,6 +453,14 @@
+ 			clocks = <&pwm_pclk_gate>;
+ 		};
+ 
++		pmu: pmu@91000000 {
++			compatible = "canaan,k230-pmu";
++			reg = <0x0 0x91000000 0x0 0x80>,
++			      <0x0 0x910000a0 0x0 0x10>;
++			interrupts = <175 IRQ_TYPE_LEVEL_HIGH>;
++			status = "disabled";
++		};
++
+ 		rtc: rtc@0x91000c00 {
+ 			compatible = "canaan,k230-rtc";
+ 			reg = <0x0 0x91000c00 0x0 0x20>;
+-- 
+2.43.0
+

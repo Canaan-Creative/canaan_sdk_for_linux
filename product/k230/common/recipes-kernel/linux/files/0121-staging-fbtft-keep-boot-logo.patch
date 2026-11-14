@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] staging: fbtft: keep the panel content at registration
+
+fbtft_register_framebuffer() flushes the newly allocated, zeroed
+framebuffer to the panel. When the boot loader has already initialised
+the controller and drawn a boot logo, that clears the screen to black.
+
+Drop the initial full-display update. init_display(), set_var() and
+set_gamma() still bring the controller up; they touch controller
+registers, not display RAM, so the panel keeps its content until
+userspace draws. Runtime updates through deferred I/O are unaffected.
+
+Upstream-Status: Pending
+---
+ drivers/staging/fbtft/fbtft-core.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/fbtft/fbtft-core.c b/drivers/staging/fbtft/fbtft-core.c
+index eac1d570f..dd0b4c9be 100644
+--- a/drivers/staging/fbtft/fbtft-core.c
++++ b/drivers/staging/fbtft/fbtft-core.c
+@@ -818,8 +818,12 @@ int fbtft_register_framebuffer(struct fb_info *fb_info)
+ 			goto reg_fail;
+ 	}
+ 
+-	/* update the entire display */
+-	par->fbtftops.update_display(par, 0, par->info->var.yres - 1);
++	/*
++	 * No initial full-display update: the framebuffer starts zeroed, and
++	 * flushing it would clear what the boot loader drew on the panel. The
++	 * panel keeps its content until userspace draws; runtime updates are
++	 * unaffected.
++	 */
+ 
+ 	if (par->fbtftops.set_gamma && par->gamma.curves) {
+ 		ret = par->fbtftops.set_gamma(par, par->gamma.curves);
+-- 
+2.43.0
+

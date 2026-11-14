@@ -1,0 +1,46 @@
+# ── xuantie-yocto monorepo clone cache (created by ./build.sh setup) ─────────
+.xuantie-yocto-src/
+
+# ── Upstream Yocto layers (fetched by setup, not owned here) ─────────────────
+build/yocto/.xuantie-version
+build/yocto/openembedded-core/
+build/yocto/meta-xuantie/
+build/yocto/meta-k230/
+build/yocto/meta-openembedded/
+build/yocto/meta-riscv/
+build/yocto/meta-clang/
+build/yocto/meta-external-toolchain/
+
+# ── Toolchain binaries (a dir, or a symlink to a shared toolchain) ───────────
+build/yocto/riscv-toolchain-gcc
+build/yocto/riscv-toolchain-clang
+build/yocto/riscv-toolchain-gcc-muslc
+
+# ── Yocto build artifacts ────────────────────────────────────────────────────
+build/yocto/downloads/
+build/yocto/xuantie-build/downloads/
+build/yocto/xuantie-build/sstate-cache/
+build/yocto/xuantie-build/xuantie/tmp-glibc/
+build/yocto/xuantie-build/xuantie/cache/
+build/yocto/xuantie-build/xuantie/buildhistory/
+build/yocto/xuantie-build/xuantie/bitbake-cookerdaemon.log
+build/yocto/xuantie-build/xuantie/conf/exttc_sanity_info
+build/yocto/xuantie-build/xuantie/bitbake.lock
+
+# ./build.sh output: flash images
+build/images/
+
+# Host-local pack tooling for gen-spinand (.kdimg): pycryptodome venv.
+build/.pack-venv/
+build/.pack-venv.lock
+
+# bitbake externalsrc convenience symlinks dropped into a recipe's source dir
+# (point into build/yocto/.../work/...); regenerated on every build.
+oe-logs
+oe-workdir
+
+# Test outputs (junit reports and per-suite logs)
+test/results/
+
+# Python bytecode
+__pycache__/

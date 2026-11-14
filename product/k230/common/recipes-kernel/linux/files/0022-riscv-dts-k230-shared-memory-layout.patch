@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: add a shared memory layout include
+
+Add k230-canaan-mem.dtsi, which declares the Linux DRAM window from 0x0
+and, optionally, a multimedia CMA pool. A board file defines the knobs
+before it includes the file:
+
+  K230_DRAM_TOP        (required) DRAM size counted from 0x0
+  K230_MEDIA_CMA_SIZE  (optional) size of the multimedia CMA pool
+
+OpenSBI adds its own no-map firmware reservation (mmode_resv) to the
+DTB, so the include does not carve out the firmware region.
+
+Upstream-Status: Pending
+---
+ .../boot/dts/canaan/k230-canaan-mem.dtsi      | 42 +++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+ create mode 100644 arch/riscv/boot/dts/canaan/k230-canaan-mem.dtsi
+
+diff --git a/arch/riscv/boot/dts/canaan/k230-canaan-mem.dtsi b/arch/riscv/boot/dts/canaan/k230-canaan-mem.dtsi
+new file mode 100644
+index 000000000..dc6efd97a
+--- /dev/null
++++ b/arch/riscv/boot/dts/canaan/k230-canaan-mem.dtsi
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++/*
++ * Shared Canaan K230 DDR memory layout.
++ *
++ * Define the knobs before including this file:
++ *   K230_DRAM_TOP        (required) DRAM size counted from 0x0, e.g. 0x7ffe000.
++ *   K230_MEDIA_CMA_SIZE  (optional) CMA pool for multimedia (MMZ/VPU/ISP);
++ *                        omit it to reserve no pool.
++ *
++ * OpenSBI injects its own firmware reservation (mmode_resv, no-map) into the
++ * DTB at boot, so the low firmware region is carved by firmware, not here.
++ */
++
++#ifndef K230_DRAM_TOP
++#error "define K230_DRAM_TOP before including k230-canaan-mem.dtsi"
++#endif
++
++/ {
++	memory@0 {
++		device_type = "memory";
++		reg = <0x0 0x0 0x0 K230_DRAM_TOP>;
++	};
++
++#ifdef K230_MEDIA_CMA_SIZE
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		media_cma: linux,cma {
++			compatible = "shared-dma-pool";
++			reusable;
++			size = <0x0 K230_MEDIA_CMA_SIZE>;
++			alignment = <0x0 0x400000>;
++			linux,cma-default;
++		};
++	};
++#endif
++};
+-- 
+2.43.0
+

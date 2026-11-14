@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] soc: canaan: add the k230 pmu power key driver
+
+Add a driver for the power key of the K230 power management unit,
+compatible canaan,k230-pmu. It programs the INT0 force power-down,
+power event and debounce counts from the int0 child node, routes the
+power event to the CPU and reports it as a KEY_POWER press and release
+on the input device pmu_input. At probe it sets PMU_STATUS to a forced
+power-down; its power-off handler sets a normal power-down and cuts the
+SoC power through the PMU output control. The PMU block shares its
+0x80-0x9f range with the pmuiomux pin controller, so the driver takes
+two register ranges.
+
+Upstream-Status: Pending
+---
+ drivers/soc/canaan/k230-pmu.c | 166 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 166 insertions(+)
+ create mode 100644 drivers/soc/canaan/k230-pmu.c
+
+diff --git a/drivers/soc/canaan/k230-pmu.c b/drivers/soc/canaan/k230-pmu.c
+new file mode 100644
+index 0000000..6b52602
+--- /dev/null
++++ b/drivers/soc/canaan/k230-pmu.c
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2026, Canaan Creative Co., Ltd.
++ */
++
++#include <linux/bits.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/reboot.h>
++
++#define PMU_STATUS		0x3c
++#define PMU_INT2OUTPUT0_EN	0x40
++#define PMU_INT2CPU_EN		0x48
++#define PMU_INT_EN		0x4c
++#define PMU_INT_TYPE		0x50
++#define PMU_INT_CLEAR		0x54
++#define PMU_INT0_0_TRIGGER_VAL	0x58
++#define PMU_INT8_TRIGGER_VAL	0x5c
++#define PMU_INT0_DEBOUNCE_VAL	0x64
++#define PMU_OUTPUT_REG_CTL	0x78
++
++#define PMU_INT_STATUS		0x0c
++
++#define PMU_INT8_EN		BIT(12)
++#define PMU_INT0_0_EN		BIT(11)
++#define PMU_INT_CLEAR_ALL	0x3ff
++#define PMU_INT_CLEAR_SHIFT	3
++
++#define PMU_SOC_FORCE_PD	1
++#define PMU_SOC_NORMAL_PD	2
++
++struct k230_pmu {
++	void __iomem *regs;
++	void __iomem *status;
++	struct input_dev *input;
++};
++
++static void k230_pmu_config(struct k230_pmu *pmu, struct device_node *node)
++{
++	struct device_node *np;
++	u32 value;
++
++	np = of_get_child_by_name(node, "int0");
++	if (np) {
++		if (!of_property_read_u32(np, "force-powerdown-value", &value))
++			writel(value, pmu->regs + PMU_INT8_TRIGGER_VAL);
++		if (!of_property_read_u32(np, "power-event-value", &value))
++			writel(value, pmu->regs + PMU_INT0_0_TRIGGER_VAL);
++		if (!of_property_read_u32(np, "debounce-value", &value))
++			writel(value, pmu->regs + PMU_INT0_DEBOUNCE_VAL);
++		of_node_put(np);
++	}
++
++	writel(0, pmu->regs + PMU_INT_EN);
++	writel(PMU_INT_CLEAR_ALL, pmu->regs + PMU_INT_CLEAR);
++	writel(0, pmu->regs + PMU_INT_TYPE);
++	writel(PMU_INT8_EN | PMU_INT0_0_EN, pmu->regs + PMU_INT_EN);
++	writel(PMU_INT0_0_EN, pmu->regs + PMU_INT2OUTPUT0_EN);
++	writel(PMU_INT0_0_EN, pmu->regs + PMU_INT2CPU_EN);
++}
++
++static irqreturn_t k230_pmu_isr(int irq, void *dev_id)
++{
++	struct k230_pmu *pmu = dev_id;
++	u32 status;
++
++	status = readl(pmu->status + PMU_INT_STATUS) &
++		 readl(pmu->regs + PMU_INT2CPU_EN);
++	if (!status)
++		return IRQ_NONE;
++
++	writel(status >> PMU_INT_CLEAR_SHIFT, pmu->regs + PMU_INT_CLEAR);
++
++	if (status & PMU_INT0_0_EN) {
++		input_report_key(pmu->input, KEY_POWER, 1);
++		input_report_key(pmu->input, KEY_POWER, 0);
++		input_sync(pmu->input);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static int k230_pmu_power_off(struct sys_off_data *data)
++{
++	struct k230_pmu *pmu = data->cb_data;
++
++	writel(PMU_SOC_NORMAL_PD, pmu->regs + PMU_STATUS);
++	writel(1, pmu->regs + PMU_OUTPUT_REG_CTL);
++	writel(PMU_INT_CLEAR_ALL, pmu->regs + PMU_INT_CLEAR);
++	writel(0, pmu->regs + PMU_OUTPUT_REG_CTL);
++
++	return NOTIFY_DONE;
++}
++
++static int k230_pmu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct k230_pmu *pmu;
++	int irq, ret;
++
++	pmu = devm_kzalloc(dev, sizeof(*pmu), GFP_KERNEL);
++	if (!pmu)
++		return -ENOMEM;
++
++	pmu->regs = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(pmu->regs))
++		return PTR_ERR(pmu->regs);
++
++	pmu->status = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(pmu->status))
++		return PTR_ERR(pmu->status);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	writel(PMU_SOC_FORCE_PD, pmu->regs + PMU_STATUS);
++	k230_pmu_config(pmu, dev->of_node);
++
++	pmu->input = devm_input_allocate_device(dev);
++	if (!pmu->input)
++		return -ENOMEM;
++
++	pmu->input->name = "pmu_input";
++	input_set_capability(pmu->input, EV_KEY, KEY_POWER);
++
++	ret = input_register_device(pmu->input);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to register input device\n");
++
++	ret = devm_request_irq(dev, irq, k230_pmu_isr, 0, "k230-pmu", pmu);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request irq\n");
++
++	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_POWER_OFF,
++					    SYS_OFF_PRIO_DEFAULT,
++					    k230_pmu_power_off, pmu);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to register power-off handler\n");
++
++	return 0;
++}
++
++static const struct of_device_id k230_pmu_of_match[] = {
++	{ .compatible = "canaan,k230-pmu" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, k230_pmu_of_match);
++
++static struct platform_driver k230_pmu_driver = {
++	.driver = {
++		.name = "k230-pmu",
++		.of_match_table = k230_pmu_of_match,
++	},
++	.probe = k230_pmu_probe,
++};
++module_platform_driver(k230_pmu_driver);
++
++MODULE_DESCRIPTION("Canaan K230 PMU power key driver");
++MODULE_LICENSE("GPL");
+-- 
+2.43.0

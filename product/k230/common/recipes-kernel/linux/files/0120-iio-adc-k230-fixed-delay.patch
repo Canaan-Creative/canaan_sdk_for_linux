@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] iio: adc: k230: use a fixed conversion delay
+
+Starting the conversion by writing channel and start (0x10) in one
+access and then polling the done bits for up to about 1 ms intermittently
+times out under repeated back-to-back reads, and read() returns
+-ETIMEDOUT.
+
+Latch the channel first, set the start bit with a separate
+read-modify-write, wait a fixed 1 ms and read the data register. There
+is no done-bit poll left to time out.
+
+Upstream-Status: Pending
+---
+ drivers/iio/adc/k230-adc.c | 27 +++++++++++++++++----------
+ 1 file changed, 17 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/iio/adc/k230-adc.c b/drivers/iio/adc/k230-adc.c
+index 261d28afe..95a0c3b4f 100644
+--- a/drivers/iio/adc/k230-adc.c
++++ b/drivers/iio/adc/k230-adc.c
+@@ -93,22 +93,29 @@ static int k230_adc_init(struct k230_adc_priv *dev)
+ static int k230_adc_read(struct k230_adc_priv *dev, int channel)
+ {
+ 	struct k230_adc_regs *regs = dev->base;
+-	int ret = -ETIMEDOUT, timeout;
++	u32 data;
+ 
+ 	mutex_lock(&dev->lock);
+ 
+-	writel(channel | 0x10, &regs->cfg_reg);
+-	for (timeout = 0; timeout < 1000; timeout++) {
+-		if ((readl(&regs->cfg_reg) & 0x10100) == 0x10000) {
+-			ret = readl(&regs->data_reg[channel]);
+-			break;
+-		}
+-		fsleep(1);
+-	}
++	/*
++	 * Fixed-delay conversion sequence: latch the channel first, then set
++	 * the start bit (0x10) as a separate read-modify-write, wait a fixed
++	 * 1ms, and read the result. Polling the done bits after a single
++	 * channel|start write intermittently times out under repeated
++	 * back-to-back reads.
++	 */
++	writel(channel, &regs->cfg_reg);
++	data = readl(&regs->cfg_reg);
++	data |= 0x10;
++	writel(data, &regs->cfg_reg);
++
++	mdelay(1);
++
++	data = readl(&regs->data_reg[channel]);
+ 
+ 	mutex_unlock(&dev->lock);
+ 
+-	return ret;
++	return data;
+ }
+ 
+ static int k230_adc_read_raw(struct iio_dev *indio_dev,
+-- 
+2.43.0
+

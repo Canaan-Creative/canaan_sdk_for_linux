@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] drm/canaan: reset the display before enabling the crtc
+
+Reset the display subsystem and the video output block before the CRTC
+is configured, so that state left behind by the boot loader does not
+disturb the new mode. Start the vertical active zone on line vbp, not
+one line late, and program the background colour from vo->background
+instead of a fixed white.
+
+The DRM device takes no runtime PM reference on open and does not
+enable runtime PM at probe.
+
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/canaan/canaan_drv.c |  2 --
+ drivers/gpu/drm/canaan/canaan_vo.c  | 36 +++++++++++++++++++++++++++--
+ 2 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/canaan/canaan_drv.c b/drivers/gpu/drm/canaan/canaan_drv.c
+index 40840e38f..4cd0c4237 100644
+--- a/drivers/gpu/drm/canaan/canaan_drv.c
++++ b/drivers/gpu/drm/canaan/canaan_drv.c
+@@ -213,7 +213,6 @@ static int canaan_drm_open(struct inode *inode, struct file *filp)
+ {
+ 	int ret;
+ 
+-	pm_runtime_get_sync(disp_dev);
+ 	ret = drm_open(inode, filp);
+ 
+ 	return ret;
+@@ -340,7 +339,6 @@ static int canaan_drm_platform_probe(struct platform_device *pdev)
+ 	struct component_match *match = NULL;
+ 
+ 	disp_dev = dev;
+-	pm_runtime_enable(disp_dev);
+ 	match = canaan_drm_match_add(dev);
+ 	if (IS_ERR(match))
+ 		return PTR_ERR(match);
+diff --git a/drivers/gpu/drm/canaan/canaan_vo.c b/drivers/gpu/drm/canaan/canaan_vo.c
+index 0bcb30b81..b33bd2f48 100644
+--- a/drivers/gpu/drm/canaan/canaan_vo.c
++++ b/drivers/gpu/drm/canaan/canaan_vo.c
+@@ -632,7 +632,7 @@ static void canaan_vo_set_timing(struct canaan_vo *vo,
+ 
+ 	// set yzone
+ 	reg = 0;
+-	reg = (vbp + 1) + (((vact + (vbp + 1)) - 1) << 16);
++	reg = (vbp) + (((vact + (vbp)) - 1) << 16);
+ 	canaan_vo_write(vo, VO_DISP_YZONE_CTL, reg);
+ 
+ 	// set total size
+@@ -649,16 +649,48 @@ static void canaan_vo_set_timing(struct canaan_vo *vo,
+ 	canaan_vo_write(vo, VO_DISP_IRQ1_CTL, reg);
+ }
+ 
++int kd_vo_software_reset(void)
++{
++	void *vo_reg;
++
++	vo_reg = ioremap(0x90840000, 0x10000);
++
++	writel(0x0f, vo_reg + 0);
++	writel(0x00, vo_reg + 0x8);
++	writel(0x00, vo_reg + 0x4);
++
++	iounmap(vo_reg);
++	return 0;
++}
++
++int k230_display_rst(void)
++{
++	void *rst;
++
++	rst = ioremap(0x91101090, 4);
++	writel(0, rst);
++	msleep(1);
++	writel(0xffffffff, rst);
++	iounmap(rst);
++
++	msleep(1);
++
++	kd_vo_software_reset();
++	return 0;
++}
++
+ void canaan_vo_enable_crtc(struct canaan_vo *vo,
+ 			struct canaan_crtc *canaan_crtc,
+ 			struct drm_display_mode *adjusted_mode)
+ {
++	k230_display_rst();
++
+ 	canaan_vo_init(vo);
+ 	// set timing
+ 	canaan_vo_set_timing(vo, adjusted_mode);
+ 	// set background
+ 	canaan_vo_write(vo, VO_DISP_BACKGROUND,
+-			0xffffff); // enalbe remap  0x77f8437
++			vo->background);
+ 	// enable vo
+ 	canaan_vo_write(vo, VO_REG_LOAD_CTL, 0x11);
+ }
+-- 
+2.43.0
+

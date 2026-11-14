@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Wed, 1 Jan 2025 00:00:00 +0000
+Subject: [PATCH] riscv: dts: k230: name the pwm nodes after their channels
+
+Each K230 PWM block drives three channels. Rename pwm0 to pwm0_2 and
+pwm1 to pwm3_5 so that board files reference the block by the channels
+it carries.
+
+Upstream-Status: Pending
+---
+ arch/riscv/boot/dts/canaan/k230.dtsi | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/riscv/boot/dts/canaan/k230.dtsi b/arch/riscv/boot/dts/canaan/k230.dtsi
+index 866fc0738..1e5875b27 100644
+--- a/arch/riscv/boot/dts/canaan/k230.dtsi
++++ b/arch/riscv/boot/dts/canaan/k230.dtsi
+@@ -539,13 +539,13 @@ adc: adc@9140d000 {
+ 			clocks = <&adc_clk>;
+ 		};
+ 
+-		pwm0: pwm0@9140a000 {
++		pwm0_2: pwm0_2@9140a000 {
+ 			compatible = "canaan,k230-pwm";
+ 			reg = <0x0 0x9140a000 0x0 0x40>;
+ 			clocks = <&pwm_pclk_gate>;
+ 		};
+ 
+-		pwm1: pwm1@9140a040 {
++		pwm3_5: pwm3_5@9140a040 {
+ 			compatible = "canaan,k230-pwm";
+ 			reg = <0x0 0x9140a040 0x0 0x40>;
+ 			clocks = <&pwm_pclk_gate>;
+-- 
+2.43.0
+
